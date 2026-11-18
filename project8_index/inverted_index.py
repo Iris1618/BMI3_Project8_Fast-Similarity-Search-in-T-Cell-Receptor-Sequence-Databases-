@@ -1,5 +1,3 @@
-"""Build a k-mer index of TCR sequences and find candidate reference IDs for each query."""
-
 import argparse
 import csv
 import json
