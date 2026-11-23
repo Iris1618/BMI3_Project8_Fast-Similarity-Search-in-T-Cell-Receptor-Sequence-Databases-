@@ -1,4 +1,4 @@
-"""Small file helpers shared by the two input preparation scripts."""
+"""Shared steps: assign sequence IDs, format query rows, and save TSV/JSON files."""
 
 import csv
 import hashlib

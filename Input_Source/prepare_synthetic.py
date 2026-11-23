@@ -18,6 +18,7 @@ MOTIF = "GQE"
 
 
 def make_pool(length, size, motif, present, rng):
+    # GENERATE sequences -> KEEP the requested motif status -> REMOVE duplicates.
     sequences = []
     seen = set()
     start = (length - len(motif)) // 2
@@ -34,13 +35,13 @@ def make_pool(length, size, motif, present, rng):
 
 
 def edit_sequence(source, operation, count, rng):
+    # APPLY the edits -> CHECK the source distance -> RETRY if needed.
     for _ in range(100):
         sequence = source
         events = []
+        positions = range(count)
         if operation == "substitution":
             positions = rng.sample(range(1, len(source) - 1), count)
-        else:
-            positions = [None] * count
         for position in positions:
             if operation == "insertion":
                 position = rng.randrange(1, len(sequence))
@@ -61,17 +62,17 @@ def edit_sequence(source, operation, count, rng):
 
 
 def write_queries(directory, references, sources, args, length, name):
+    # COPY or EDIT each template, then ADD short and candidate-negative queries.
     queries, histories = [], []
     rng = random.Random(args.seed + length * 10 + 3)
+    operations = [("exact_copy", 0)]
+    for operation in ("substitution", "insertion", "deletion"):
+        operations.extend((operation, count) for count in range(1, args.max_edits + 1))
     for source in sources:
-        examples = [(source, "exact_copy", [], 0)]
-        for operation in ("substitution", "insertion", "deletion"):
-            for count in range(1, args.max_edits + 1):
-                sequence, events, distance = edit_sequence(source, operation, count, rng)
-                examples.append((sequence, operation, events, distance))
-        for sequence, category, events, distance in examples:
+        for operation, count in operations:
+            sequence, events, distance = edit_sequence(source, operation, count, rng)
             query_id = f"{name}_Q{len(queries) + 1:04d}"
-            queries.append(query_row(query_id, sequence, category,
+            queries.append(query_row(query_id, sequence, operation,
                                      references[source], source, len(events), distance))
             histories.append({"query_id": query_id, "events": events})
     for n in (1, 2, 3):
@@ -87,23 +88,14 @@ def write_queries(directory, references, sources, args, length, name):
     return dict(Counter(row["category"] for row in queries))
 
 
-def make_probes(output, length, libraries, args):
+def make_probes(output, length, sources, existing, args):
+    # EDIT outside GQE -> EXCLUDE exact copies -> SHARE queries across proportions.
     if args.probe_count == 0:
         return
     motif_start = (length - len(MOTIF)) // 2
-    positive = [refs for refs in libraries if any(MOTIF in s for s in refs)]
-    if not positive:
-        raise ValueError("Motif probes require a library with positive motif percentage")
-    shared_sources = set(positive[0])
-    for refs in positive[1:]:
-        shared_sources.intersection_update(refs)
-    sources = sorted(
-        s for s in shared_sources
-        if s.count(MOTIF) == 1 and s[motif_start:motif_start + len(MOTIF)] == MOTIF
-    )
+    sources = sorted(s for s in sources if s.count(MOTIF) == 1)
     rng = random.Random(args.probe_seed + length)
     rng.shuffle(sources)
-    existing = set().union(*(set(refs) for refs in libraries))
     queries = []
     for source in sources:
         options = []
@@ -119,7 +111,8 @@ def make_probes(output, length, libraries, args):
         query = rng.choice(options)
         existing.add(query)
         query_id = f"GQE_L{length:02d}_Q{len(queries) + 1:02d}"
-        queries.append(query_row(query_id, query, "motif_probe", positive[0][source], source, 1, 1))
+        source_id = sequence_id("SYN_", source)
+        queries.append(query_row(query_id, query, "motif_probe", source_id, source, 1, 1))
         if len(queries) == args.probe_count:
             write_tsv(output / "motif_probes" / f"L{length}" / "queries.tsv", QUERY_FIELDS, queries)
             return
@@ -127,19 +120,18 @@ def make_probes(output, length, libraries, args):
 
 
 def prepare(args, output):
+    # MIX two sequence pools at each proportion -> WRITE libraries and queries.
     reports = []
+    motif_counts = [round(args.size * p / 100) for p in args.motif_percentages]
     for length in args.lengths:
         absent = make_pool(length, args.size, MOTIF, False, random.Random(args.seed + length * 10))
         present = make_pool(length, args.size, MOTIF, True, random.Random(args.seed + length * 10 + 1))
-        libraries = []
-        for percentage in args.motif_percentages:
-            motif_count = round(args.size * percentage / 100)
+        for percentage, motif_count in zip(args.motif_percentages, motif_counts):
             sequences = absent[:args.size - motif_count] + present[:motif_count]
             random.Random(args.seed + length * 10 + 2).shuffle(sequences)
             references = {s: sequence_id("SYN_", s) for s in sequences}
             if len(set(references.values())) != args.size:
                 raise ValueError("Duplicate reference ID or sequence")
-            libraries.append(references)
             name = f"L{length}_motif{percentage:03d}"
             directory = output / name
             write_tsv(directory / "reference.tsv", REFERENCE_FIELDS,
@@ -150,7 +142,10 @@ def prepare(args, output):
                       "query_categories": categories, "seed": args.seed}
             write_json(directory / "generation_report.json", report)
             reports.append(report)
-        make_probes(output, length, libraries, args)
+        # Positive libraries use prefixes of the same motif pool.
+        shared_count = min((n for n in motif_counts if n > 0), default=0)
+        existing = set(absent[:args.size - min(motif_counts)] + present[:max(motif_counts)])
+        make_probes(output, length, present[:shared_count], existing, args)
     write_json(output / "generation_report.json", {
         "size": args.size, "lengths": args.lengths, "motif": MOTIF,
         "motif_percentages": args.motif_percentages, "max_edits": args.max_edits,
@@ -187,15 +182,15 @@ def main():
     for percentage in args.motif_percentages:
         if not 0 <= percentage <= 100 or args.size - round(args.size * percentage / 100) < args.anchors:
             parser.error("Percentages must be 0-100 and leave enough background source sequences")
+    if args.probe_count and not any(round(args.size * p / 100) > 0 for p in args.motif_percentages):
+        parser.error("Motif probes require a library with positive motif percentage")
     if args.out.exists():
         parser.error("Output directory exists. Choose a new --out directory")
     try:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=args.out.parent) as temporary:
-            output = Path(temporary) / "synthetic"
-            output.mkdir()
-            prepare(args, output)
-            output.rename(args.out)
+            prepare(args, Path(temporary))
+            Path(temporary).rename(args.out)
     except (OSError, ValueError) as error:
         parser.exit(2, f"error: {error}\n")
 

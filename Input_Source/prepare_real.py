@@ -10,10 +10,14 @@ import platform
 import random
 import tempfile
 
-from .common import AMINO_ACIDS, QUERY_FIELDS, REFERENCE_FIELDS, sequence_id, write_json, write_tsv
+from .common import (
+    AMINO_ACIDS, QUERY_FIELDS, REFERENCE_FIELDS, query_row,
+    sequence_id, write_json, write_tsv,
+)
 
 
 def prepare(args, output):
+    # READ records -> FILTER species/chain -> CLEAN CDR3 -> GROUP duplicates.
     records = {}
     counts = Counter(raw_rows=0, target_rows=0, valid_rows=0, missing_cdr3=0,
                      invalid_amino_acid=0, normalised_rows=0, excluded_species_or_chain=0)
@@ -47,6 +51,7 @@ def prepare(args, output):
             counts["normalised_rows"] += sequence != row["cdr3"]
             records.setdefault(sequence, []).append({"source_line": line_number, "fields": row})
 
+    # SAVE each unique sequence together with all its annotation records.
     sequences = sorted(records)
     if max(args.sizes) > len(sequences):
         raise ValueError(f"Requested subset exceeds {len(sequences)} available unique sequences")
@@ -67,14 +72,14 @@ def prepare(args, output):
               ({"reference_id": ids[s], "sequence": s, "length": len(s)}
                for s in sequences if len(s) < 8 or len(s) > 30))
 
+    # SHUFFLE once -> TAKE nested subsets -> SAMPLE queries from the smallest.
     random.Random(args.seed).shuffle(sequences)
     for size in args.sizes:
         write_tsv(output / f"reference_n{size}.tsv", REFERENCE_FIELDS,
                   ({"reference_id": ids[s], "sequence": s} for s in sequences[:size]))
     queries = random.Random(args.seed + 1).sample(sequences[:min(args.sizes)], args.queries)
     write_tsv(output / "queries.tsv", QUERY_FIELDS, (
-        {"query_id": f"REAL_Q{i:04d}", "sequence": s, "category": "exact_copy",
-         "source_id": ids[s], "source_sequence": s, "applied_edits": 0, "source_distance": 0}
+        query_row(f"REAL_Q{i:04d}", s, "exact_copy", ids[s], s, 0, 0)
         for i, s in enumerate(queries, 1)
     ))
     counts["unique_sequences"] = len(records)
@@ -108,10 +113,8 @@ def main():
     try:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=args.out.parent) as temporary:
-            output = Path(temporary) / "real"
-            output.mkdir()
-            prepare(args, output)
-            output.rename(args.out)
+            prepare(args, Path(temporary))
+            Path(temporary).rename(args.out)
     except (OSError, ValueError) as error:
         parser.exit(2, f"error: {error}\n")
 
