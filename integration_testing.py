@@ -1,18 +1,38 @@
-"""BMI3 Project 8 集成测试入口。
+"""Integration test entry point for BMI3 Project 8.
 
-定位：这里不做单个函数的白盒测试，而是把 Input_Source、
-Inverted_Index、两种编辑距离验证器和 Exhaustive_Benchmark 串起来，
-验证它们组合后仍能得到与穷举基线一致的结果。各目录下的
-test_*.py 仍然负责单元级测试。
+Purpose
+-------
+This file deliberately focuses on cross-module behavior instead of
+white-box unit tests. It wires together Input_Source, Inverted_Index,
+both edit-distance verifiers, and Exhaustive_Benchmark, then checks that
+the combined pipeline still agrees with an exhaustive baseline. Unit
+tests for individual modules remain in their own test_*.py files.
 
-运行方式（在仓库根目录）：
+What is covered
+---------------
+1. Example data across every combination of threshold d, k-mer size k,
+   and seed strategy.
+2. The two public search_one result builders (indexed vs. exhaustive).
+3. The real candidate-generation CLI and its overwrite guard.
+4. compare.py validate mode with externally supplied truth files.
+5. benchmark and memory measurement contracts.
+6. Synthetic data generation followed by a full search.
+7. VDJdb-style cleaning on a small handcrafted input.
 
-    python test.py -v
-    python -m unittest test -v
+How to run
+----------
+From the repository root:
 
-前置条件：Python 3.10+；Input_Source/examples 下的示例 TSV 存在。
-测试只依赖示例数据和临时生成的合成数据，不依赖真实 VDJdb 下载。
-所有写操作都限制在 tempfile.TemporaryDirectory() 中。
+    python integration_testing.py -v
+    python -m unittest integration_testing -v
+
+Requirements
+------------
+Python 3.10+ (verification.py uses ``int | None`` annotations).
+Input_Source/examples/reference.tsv and queries.tsv must exist.
+No real VDJdb download is required: the suite uses the bundled examples
+plus deterministic synthetic data. Every write goes to
+tempfile.TemporaryDirectory(), so the repository is never modified.
 """
 
 import csv
@@ -27,8 +47,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 WORKSPACE = Path(__file__).resolve().parent
-# 代码目录名通常是固定的，但允许克隆目录带后缀，因此先按完整名查找，
-# 找不到再用 glob 兜底，避免 test.py 因目录改名而直接导入失败。
+#The code directory name is normally stable, but a downloaded or cloned copy may carry a suffix. Try the canonical path first and fall back to a glob match so renaming the folder does not break imports.
 PROJECT = (
     WORKSPACE
     / "BMI3_code"
@@ -37,19 +56,20 @@ PROJECT = (
 if not PROJECT.is_dir():
     matches = sorted((WORKSPACE / "BMI3_code").glob("BMI3_Project8*"))
     if not matches:
-        raise RuntimeError("找不到 BMI3_Project8 代码目录")
+        raise RuntimeError("Cannot locate the BMI3_Project8 code directory")
     PROJECT = matches[0]
 INDEX_DIR = PROJECT / "Inverted_Index"
-# 必须同时加入两个路径：
-# - PROJECT：让 Exhaustive_Benchmark / Input_Source 以包的形式导入；
-# - INDEX_DIR：integration_example.py 内部使用扁平导入 inverted_index，
-#   只有把该目录放进 sys.path 才能复用它的真实实现。
+""" Add two entries to sys.path:
+   PROJECT   -> lets Exhaustive_Benchmark and Input_Source be imported as
+                packages;
+   INDEX_DIR -> integration_example.py uses a flat ``import inverted_index``; putting its own directory on sys.path reuses the real production implementation without editing it.
+"""
 for module_path in (str(PROJECT), str(INDEX_DIR)):
     if module_path not in sys.path:
         sys.path.insert(0, module_path)
 
-# 注意：索引侧使用扁平导入，评测侧使用包导入，这与各模块自身的导入方式
-# 保持一致，避免为了测试去修改生产代码。
+# Import style mirrors each module's original layout: the index side is flat, while the benchmark and input-preparation sides are packaged.
+# Keeping both styles avoids changing production code just to satisfy the test harness.
 from Exhaustive_Benchmark.baseline import exhaustive_matches, search_one as baseline_search_one
 from Exhaustive_Benchmark.compare import (
     benchmark,
@@ -71,23 +91,48 @@ STRATEGIES = ("spread", "prefix")
 
 
 def basic_verifier(query, reference, max_distance):
-    """把基础 DP 适配成与 verify 相同的返回约定。
+    """Adapt the basic DP to the same return contract as verify().
 
-    verification_basic 总是返回 int，而 verification.verify 在距离超过
-    阈值时返回 None。统一成 None 后，两个验证器才能共用 run_indexed，
-    测试比较的也就是“最终命中集合和距离”，而不是各自的返回值风格。
+    verification_basic always returns an int. verification.verify returns
+    None when the distance exceeds max_distance. Normalizing both to the
+    None-on-miss convention lets run_indexed() use either implementation
+    and keeps assertions focused on the final hit set and distances
+    rather than on each verifier's individual API style.
+
+    Args:
+        query: Query amino-acid sequence.
+        reference: Reference amino-acid sequence.
+        max_distance: Inclusive edit-distance threshold.
+
+    Returns:
+        The edit distance when it is <= max_distance, otherwise None.
     """
     distance = verification_basic(query, reference)
     return distance if distance <= max_distance else None
 
 
 def run_indexed(index, query, d, verifier, strategy="spread"):
-    """复现线上检索链路：生成候选 -> 只对候选跑 DP -> 收集 ≤ d 的命中。
+    """Reproduce the production retrieval path for one query.
 
-    返回 (CandidateResult, {reference_id: distance})。
-    测试中把它与穷举结果比较，即可同时检查：
-    - 候选集是否漏掉了真实命中（假阴性）；
-    - DP 给出的距离是否正确。
+    Steps:
+        1. Generate candidates from the inverted index.
+        2. Run the supplied DP verifier only on those candidates.
+        3. Keep hits whose exact distance is <= d.
+
+    Args:
+        index: An InvertedIndex built over the reference database.
+        query: Query sequence to search for.
+        d: Maximum edit distance.
+        verifier: Callable ``(query, reference, d) -> int | None``.
+        strategy: Seed layout, either "spread" or "prefix".
+
+    Returns:
+        A tuple ``(CandidateResult, {reference_id: distance})``.
+
+    Comparing the returned mapping with an exhaustive baseline checks two
+    independent properties at once:
+        - the candidate set does not lose a true hit (no false negatives);
+        - the verifier reports the correct edit distance for every hit.
     """
     candidate = index.generate_candidates(query, d, strategy)
     matches = {}
@@ -99,77 +144,99 @@ def run_indexed(index, query, d, verifier, strategy="spread"):
 
 
 def read_rows(path):
-    """读取带表头的 TSV，保留所有原始列，用于检查类别、来源等元数据。"""
+    """Read a TSV with a header and keep every original column.
+
+    Used when a test needs metadata that read_sequences() intentionally
+    discards, such as category, source_id, reason, or source_distance.
+
+    Args:
+        path: Path to a UTF-8 TSV file with a header row.
+
+    Returns:
+        A list of dictionaries, one per data row.
+    """
     with open(path, encoding="utf-8-sig", newline="") as handle:
         return list(csv.DictReader(handle, delimiter="\t"))
 
 
 class ExamplePipelineTests(unittest.TestCase):
-    """针对仓库示例数据集的端到端测试。
+    """End-to-end checks built on the bundled example dataset.
 
-    示例集很小（14 条参考、8 条查询），但覆盖普通查询、短查询回退、
-    零命中和多命中，适合做全参数组合的交叉验证。
+    The example set is deliberately small (14 references, 8 queries) but
+    covers normal queries, short-query fallback, zero-match queries, and
+    multi-match queries. That makes it practical to cross-check every
+    parameter combination instead of sampling a subset.
     """
 
     @classmethod
     def setUpClass(cls):
-        # 整个测试类共享同一份只读输入，避免每个用例重复读盘。
+        # Load the read-only inputs once per class. read_sequences() validates IDs, duplicates, alphabet, and TSV shape, so a malformed example fails here before any search assertions run.
         cls.references = read_sequences(REFERENCE_TSV, "reference_id")
         cls.queries = read_sequences(QUERIES_TSV, "query_id")
 
     def test_all_thresholds_and_strategies_match_exhaustive(self):
-        """核心正确性：所有 d/k/种子策略组合都必须与穷举基线一致。
+        """Core correctness: every d / k / seed-strategy combination must
+        agree with the exhaustive baseline.
 
-        验证逻辑分为四层：
-        1. 两个验证器给出的 {参考ID: 距离} 与穷举结果完全相同；
-        2. 真实命中必须包含在候选集中（候选只允许多、不允许漏）；
-        3. 候选必须满足长度差过滤；
-        4. 索引模式必须符合鸽巢原理的启用条件。
+        The test checks four independent layers:
+            1. Both verifiers produce exactly the same
+               {reference_id: distance} mapping as exhaustive search.
+            2. Every true hit is present in the candidate set. Candidates
+               may contain extras, but missing hits would be a false
+               negative.
+            3. Every candidate passes the length-difference filter.
+            4. The chosen mode matches the pigeonhole-principle threshold.
+
+        Scope: 3 thresholds x 2 k-mer sizes x 2 strategies x 8 queries =
+        96 search cases, each run through both verifiers.
         """
         for d in (0, 1, 2):
             for k in (2, 3):
-                # k 会改变索引内容；d 只在查询时参与候选生成和验证。
+                # k changes the index contents; d is only applied at query time, during candidate generation and verification.
                 index = InvertedIndex(self.references, k)
                 self.assertEqual(index.k, k)
                 for strategy in STRATEGIES:
                     for query_id, query in self.queries.items():
-                        # subTest 让失败信息精确到具体的 d/k/策略/查询。
+                        # subTest pinpoints the exact d/k/strategy/query combination if an assertion fails.
                         with self.subTest(d=d, k=k, strategy=strategy, query=query_id):
-                            # 独立真值：对全库做长度过滤 + 基础 DP，不经过倒排索引。
+                            # Independent oracle: length filter plus full DP over the whole database, never touching the inverted index.
                             expected = exhaustive_matches(query, self.references, d)
                             candidate, got_basic = run_indexed(
                                 index, query, d, basic_verifier, strategy
                             )
                             _, got_optimized = run_indexed(index, query, d, verify, strategy)
 
-                            # 两种 DP 实现必须给出相同的命中集合和距离。
+                            # Both verifier implementations must return the same hit set and the same distances as the exhaustive baseline.
                             self.assertEqual(got_basic, expected)
                             self.assertEqual(got_optimized, expected)
-                            # 候选只允许是真实命中的超集，不能漏召回。
+                            # The candidate set may contain extras, but it must never miss a true hit.
                             self.assertLessEqual(set(expected), set(candidate.candidate_ids))
-                            # 所有候选都必须通过长度差过滤。
+                            # Every candidate must satisfy the safe length filter, even if it came from a common k-mer.
                             self.assertTrue(
                                 all(
                                     abs(len(self.references[rid]) - len(query)) <= d
                                     for rid in candidate.candidate_ids
                                 )
                             )
-                            # 查询长度不足以切出 d+1 段长度 k 的互不重叠种子时，
-                            # 鸽巢保证失效，必须回退到全扫；否则应走索引。
+                            # The pigeonhole guarantee needs d+1 disjoint seeds of length k. 
+                            # If the query is shorter, no such partition exists and the index must fall back to a full scan; otherwise it must stay in indexed mode.
                             expected_mode = (
                                 "fallback" if len(query) < k * (d + 1) else "indexed"
                             )
                             self.assertEqual(candidate.mode, expected_mode)
 
     def test_final_result_helpers_agree(self):
-        """最终输出契约：索引版和穷举版的 search_one 必须逐字段一致。
+        """Final-output contract: indexed and exhaustive search_one must
+        agree field by field.
 
-        这条用例不比较耗时，只确认两个对外结果构造函数在字段、注释、
-        距离和排序上完全等价，避免集成阶段“换了入口就换结果”。
+        This test does not compare latency. It verifies that the two
+        public result builders return the same query metadata, hits,
+        distances, sequences, annotations, and ordering, so switching
+        entry points cannot silently change the output consumed by
+        downstream integration.
         """
         index = InvertedIndex(self.references, 2)
-        # 故意只给一条参考加注释，检查注释是否原样带到最终命中里，
-        # 而不是在索引路径中被丢掉。
+        # Only one reference carries annotations. If the indexed path drops or reshapes annotations while filtering candidates, the full-dictionary comparison below fails.
         annotations = {"EDGE_R05": [{"source_line": 5, "fields": {}}]}
         for query_id, query in self.queries.items():
             with self.subTest(query=query_id):
@@ -179,24 +246,31 @@ class ExamplePipelineTests(unittest.TestCase):
                 baseline = baseline_search_one(
                     query_id, query, self.references, 1, annotations
                 )
-                # 比较整个 dict，包括 matches、query 元信息等所有字段。
+                # Compare the whole dict, including matches, query metadata, distances, sequences, and annotations.
                 self.assertEqual(indexed, baseline)
-                # 输出顺序也是契约的一部分，避免下游 diff 出现无意义抖动。
+                # Ordering is part of the output contract. Stable ordering avoids meaningless diffs in downstream comparisons.
                 self.assertEqual(
                     indexed["matches"],
                     sorted(indexed["matches"], key=lambda hit: hit["reference_id"]),
                 )
 
     def test_candidate_cli_and_overwrite_guard(self):
-        """真实 CLI 集成 + 输出安全。
+        """Real CLI integration and output-safety checks.
 
-        这里刻意用子进程而不是直接调用 main()，因为 CLI 自己会设置
-        sys.path、解析参数并写 JSONL；只有子进程才能覆盖这条真实路径。
+        Why a subprocess: the CLI sets up sys.path, parses arguments,
+        writes JSONL, and emits a JSON summary on stderr. Calling main()
+        in-process would bypass those paths, so the test invokes the
+        module exactly as a user would.
+
+        The test runs in two phases:
+            1. Generate candidates and independently verify them.
+            2. Point --output at the input file and require a fail-closed
+               error with the input left byte-for-byte intact.
         """
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / "candidates.jsonl"
-            # 参数与 README 中的推荐用法一致，输出写到临时目录。
+            # Same flags as the documented usage. All output goes to a temporary directory, so the repository is untouched.
             command = [
                 sys.executable,
                 str(PROJECT / "Inverted_Index" / "inverted_index.py"),
@@ -211,24 +285,26 @@ class ExamplePipelineTests(unittest.TestCase):
                 command, capture_output=True, text=True, check=True
             )
             rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+            # Phase 1a: the JSONL stream must contain exactly one record per query.
             self.assertEqual(len(rows), len(self.queries))
-            # CLI 把汇总 JSON 写到 stderr，最后一行是机器可读的摘要。
+            # The CLI writes its summary JSON to stderr; the last line is the machine-readable record.
             summary = json.loads(completed.stderr.strip().splitlines()[-1])
             self.assertEqual(summary["query_count"], len(self.queries))
             self.assertEqual(summary["reference_count"], len(self.references))
-            # 每条查询要么走索引，要么回退，两者之和必须等于查询总数。
+            # Every query must take exactly one path, indexed or fallback, so the two counters must add up to the query count.
             self.assertEqual(
                 summary["indexed_queries"] + summary["fallback_queries"],
                 len(self.queries),
             )
 
-            # 用与 CLI 相同的 k 重建索引，逐条复核候选和最终命中。
+            # Phase 1b: rebuild the same index and re-verify the CLI's own candidates. 
+            # This catches a CLI that writes plausible-looking but incomplete candidate lists.
             cli_index = InvertedIndex(self.references, 2)
             for row in rows:
                 with self.subTest(query=row["query_id"]):
                     query = self.queries[row["query_id"]]
                     expected = exhaustive_matches(query, self.references, row["d"])
-                    # CLI 给出的候选必须覆盖所有真实命中。
+                    # The CLI candidates must cover every true hit.
                     self.assertLessEqual(set(expected), set(row["candidate_ids"]))
                     _, verified = run_indexed(
                         cli_index,
@@ -239,8 +315,8 @@ class ExamplePipelineTests(unittest.TestCase):
                     )
                     self.assertEqual(verified, expected)
 
-            # 覆盖保护：--output 与输入文件是同一路径时必须拒绝执行。
-            # 先复制到临时目录，避免触碰仓库里的示例文件。
+            # Phase 2: overwrite guard. Point --output at the same file used by --reference. 
+            # The CLI must refuse before truncating anything. Copy the example first so the repository file is never touched by this test.
             guarded_reference = root / "guarded_reference.tsv"
             shutil.copyfile(REFERENCE_TSV, guarded_reference)
             original = guarded_reference.read_bytes()
@@ -257,17 +333,23 @@ class ExamplePipelineTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-            # 退出码 2 是该 CLI 约定的“输入/参数错误”。
+            # The CLI reserves exit code 2 for input/argument errors.
             self.assertEqual(failed.returncode, 2)
             self.assertIn("must not overwrite an input file", failed.stderr)
-            # 关键：拒绝执行后文件内容必须一字节不变。
+            # The important part: the guard must fail closed. One changed byte would mean the input was already truncated.
             self.assertEqual(guarded_reference.read_bytes(), original)
 
     def test_compare_validate_with_generated_truth(self):
-        """compare.py validate 模式 + 外部真值文件加载。
+        """compare.py validate mode plus external truth-file loading.
 
-        真值完全由穷举基线独立生成，而不是从索引结果反推，
-        因此这一步能发现“索引和验证器一起错”的系统性偏差。
+        Truth is generated from the exhaustive baseline rather than
+        copied from indexed output, so it is independent of candidate
+        generation. Because the baseline and the ``indexed_basic`` method
+        share verification_basic, the strongest cross-check is
+        ``indexed_optimized`` (banded DP) against this truth. The
+        ``exhaustive_vs_supplied_truth`` row is expected to match by
+        construction; it exercises file loading, reference-set matching,
+        and zero-match handling rather than algorithmic independence.
         """
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -276,7 +358,7 @@ class ExamplePipelineTests(unittest.TestCase):
             output_path = root / "validation.csv"
             reference_set = "examples"
 
-            # truth_matches.tsv：每个查询的每个命中一行，距离来自穷举 DP。
+            # truth_matches.tsv: one row per query-reference hit, with the distance produced by exhaustive DP.
             with open(truth_path, "w", encoding="utf-8", newline="") as handle:
                 writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
                 writer.writerow(
@@ -290,8 +372,8 @@ class ExamplePipelineTests(unittest.TestCase):
                             [reference_set, 1, query_id, reference_id, distance]
                         )
 
-            # truth_summary.tsv：每个查询一行，用命中数和参考库大小
-            # 校验真值文件是否完整。零命中查询也必须写 n_matches=0。
+            # truth_summary.tsv: one row per query. n_matches and n_reference let the loader verify completeness. 
+            #Zero-match queries must still write n_matches=0; omitting them would make an incomplete truth file look valid.
             with open(summary_path, "w", encoding="utf-8", newline="") as handle:
                 writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
                 writer.writerow(
@@ -308,8 +390,7 @@ class ExamplePipelineTests(unittest.TestCase):
                         ]
                     )
 
-            # 先单独验证加载器：它应校验 reference_set、阈值、
-            # 参考库大小和命中数，并返回 {query_id: {reference_id: distance}}。
+            # Verify the loader on its own first. It should validate the reference set, threshold, reference count, and hit counts, then return {query_id: {reference_id: distance}}.
             loaded = load_truth(
                 truth_path, summary_path, reference_set,
                 self.queries, 1, len(self.references),
@@ -319,7 +400,7 @@ class ExamplePipelineTests(unittest.TestCase):
                     loaded[query_id], exhaustive_matches(query, self.references, 1)
                 )
 
-            # 再走完整的 validate CLI：索引两种 DP + 真值比对。
+            # Then run the full validate CLI: two indexed methods plus a comparison against the supplied truth.
             return_code = compare_main(
                 [
                     "validate",
@@ -338,7 +419,7 @@ class ExamplePipelineTests(unittest.TestCase):
 
             with open(output_path, encoding="utf-8-sig", newline="") as handle:
                 rows = list(csv.DictReader(handle))
-            # 每个查询 3 行：indexed_basic、indexed_optimized、真值比对。
+            # Each query produces three comparisons: indexed_basic, indexed_optimized, and exhaustive_vs_supplied_truth.
             self.assertEqual(len(rows), 3 * len(self.queries))
             self.assertEqual(
                 {row["comparison"] for row in rows},
@@ -350,9 +431,9 @@ class ExamplePipelineTests(unittest.TestCase):
             )
             for row in rows:
                 with self.subTest(query=row["query_id"], comparison=row["comparison"]):
-                    # bool 写入 CSV 后是字符串 "True"。
+                    # Python booleans are serialized to CSV as "True"/"False".
                     self.assertEqual(row["match"], "True")
-                    # 三类差异列表都应为空，表示无漏报、无多报、距离无误。
+                    # All three difference lists must be empty: no missing hits, no unexpected hits, and no wrong distances.
                     self.assertEqual(row["missing_ids"], "[]")
                     self.assertEqual(row["unexpected_ids"], "[]")
                     self.assertEqual(row["wrong_distances"], "[]")
@@ -361,21 +442,23 @@ class ExamplePipelineTests(unittest.TestCase):
                     )
 
     def test_benchmark_and_memory_modes(self):
-        """计时与内存评测的接口契约（不断言具体耗时）。
+        """Contract checks for timing and memory measurement, not performance.
 
-        耗时受机器负载影响，断言绝对数值会让测试变得不稳定；
-        这里只检查评测器是否产出了完整的结构、样本和方法集合。
+        Wall-clock numbers depend on machine load, so asserting an
+        absolute speedup would make the suite flaky. Instead this test
+        verifies that the benchmark produced complete, understandable
+        structures: metadata, samples per repeat, method names, units,
+        and non-empty observations.
         """
-        # d=1, k=2, spread, repeats=2：repeats 至少为 2 才能计算标准误。
+        # d=1, k=2, spread, repeats=2. At least two repeats are needed to report dispersion alongside the mean.
         metadata, rows = benchmark(self.references, self.queries, 1, 2, "spread", 2)
-        # 元数据必须记录输入规模、查询顺序、建索引样本和中位数，
-        # 这些是后续对比不同数据集时的可追溯信息。
+        # Metadata must record input size, query order, index-build samples, and the median, so runs on different datasets remain traceable.
         self.assertEqual(metadata["reference_count"], len(self.references))
         self.assertEqual(metadata["query_count"], len(self.queries))
         self.assertEqual(metadata["query_ids"], list(self.queries))
         self.assertEqual(len(metadata["index_build_ms_samples"]), 2)
         self.assertGreater(metadata["index_build_median_ms"], 0)
-        # 5 类方法：3 个整批搜索 + 2 个在相同候选对上的验证器对比。
+        # Exactly five methods: three whole-batch searches plus two verifier comparisons run on the same candidate pairs.
         self.assertEqual(
             {row["method"] for row in rows},
             {
@@ -388,10 +471,11 @@ class ExamplePipelineTests(unittest.TestCase):
         )
         for row in rows:
             with self.subTest(method=row["method"]):
-                # 每次重复都应留下一个原始样本，方便复核离散程度。
+                # Every repeat must leave one raw sample so dispersion can be audited later.
                 self.assertEqual(len(json.loads(row["samples"])), 2)
                 if row["method"].startswith("candidate_"):
-                    # 候选对方法按“每对候选”计时，单位与整批搜索不同。
+                    # Candidate-pair methods are timed per pair, so their
+                    # unit differs from whole-batch searches.
                     self.assertGreater(row["observations_per_repeat"], 0)
                     self.assertIsNotNone(row["median"])
                 else:
@@ -399,8 +483,8 @@ class ExamplePipelineTests(unittest.TestCase):
                     self.assertIsNotNone(row["mean"])
                     self.assertIsNotNone(row["median"])
 
-        # 内存对比使用 tracemalloc；索引方法包含建索引成本。
-        # 指标是 Python 增量峰值，不是进程 RSS，也不包含已预加载的数据。
+        # Memory comparison uses tracemalloc and includes index-build cost for the indexed methods. 
+        #The metric is incremental Python peak memory, not process RSS, and it excludes data loaded before the trace starts.
         memory_rows = memory_comparison(
             self.references, self.queries, 1, 2, "spread"
         )
@@ -410,22 +494,25 @@ class ExamplePipelineTests(unittest.TestCase):
         )
         for row in memory_rows:
             self.assertGreater(row["incremental_peak_python_bytes"], 0)
-            # scope 必须明确声明统计口径，避免被误当成进程内存。
+            # The scope string must state the measurement boundary so the number is not mistaken for process memory.
             self.assertIn("not RSS", row["scope"])
 
 
 class InputPreparationTests(unittest.TestCase):
-    """输入准备模块的测试：合成数据生成 + 真实数据清洗。"""
+    """Checks for the synthetic and real-data input-preparation modules."""
 
     def test_synthetic_generation_and_search(self):
-        """合成数据生成器 + 索引检索的联合验证。
+        """Joint validation of the synthetic generator and search pipeline.
 
-        使用固定种子生成 3 个 GQE motif 比例的库，因此结果可复现；
-        生成后不信任生成器自报的类别，而是重新用穷举基线核对。
+        Three libraries are generated with fixed seeds, so both the data
+        and the category labels are reproducible. The test deliberately
+        does not trust the generator's own claims: after generation it
+        re-runs exhaustive search to verify the generated metadata and the
+        indexed results.
         """
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "synthetic"
-            # 只构造 prepare() 需要的参数，避免走 argparse 和文件发布逻辑。
+            # Build only the attributes consumed by prepare(), avoiding argparse and the file-publication wrapper used by main().
             args = SimpleNamespace(
                 out=output,
                 size=40,
@@ -439,7 +526,7 @@ class InputPreparationTests(unittest.TestCase):
             )
             prepare_synthetic(args, output)
 
-            # 顶层报告应列出 3 个数据集；每个数据集还会各有一份报告。
+            # The top-level report must list all three generated datasets; each dataset also has its own per-library report.
             root_report = json.loads(
                 (output / "generation_report.json").read_text(encoding="utf-8")
             )
@@ -450,13 +537,14 @@ class InputPreparationTests(unittest.TestCase):
                 library = output / name
                 references = read_sequences(library / "reference.tsv", "reference_id")
                 queries = read_sequences(library / "queries.tsv", "query_id")
-                # rows 保留 category/source_id 等元数据，用于后面的分类检查。
+                # rows keeps metadata such as category and source_id for the category-specific checks below.
                 rows = {row["query_id"]: row for row in read_rows(library / "queries.tsv")}
 
+                # Generation must produce the requested library size, and query IDs must be unique enough to match metadata rows.
                 self.assertEqual(len(references), 40)
                 self.assertEqual(len(queries), len(rows))
 
-                # k=3，d=1/2；候选 + 带状 DP 必须与穷举基线完全一致。
+                # k=3 with d=1 and d=2. Candidate generation plus banded DP must match the exhaustive baseline exactly.
                 index = InvertedIndex(references, 3)
                 for d in (1, 2):
                     for query_id, query in queries.items():
@@ -468,24 +556,23 @@ class InputPreparationTests(unittest.TestCase):
 
                 for query_id, row in rows.items():
                     if row["category"] == "exact_copy":
-                        # 精确拷贝：应与源序列相同，且在 d=0 时候选就包含源 ID。
+                        # Exact copy: the query equals its source, the source ID exists, and even d=0 must already produce the source as a candidate.
                         self.assertEqual(row["sequence"], row["source_sequence"])
                         self.assertIn(row["source_id"], references)
                         self.assertEqual(references[row["source_id"]], row["sequence"])
                         candidate = index.generate_candidates(row["sequence"], 0)
                         self.assertIn(row["source_id"], candidate.candidate_ids)
                     if row["category"] == "short_query":
-                        # 短查询（长度 1-3）不足以切出 d+1 段长度 3 的种子，
-                        # 必须触发全库回退。
+                        # Short queries (length 1-3) cannot supply d+1 disjoint seeds of length 3, so the index must switch to a full-scan fallback.
                         candidate = index.generate_candidates(row["sequence"], 1)
                         self.assertEqual(candidate.mode, "fallback")
 
-            # motif probe 是人为构造的“接近但不等于任何参考”的查询。
+            # A motif probe is a constructed query that is close to, but not equal to, any reference sequence.
             probes_path = output / "motif_probes" / "L12" / "queries.tsv"
             self.assertTrue(probes_path.is_file())
             probes = read_rows(probes_path)
             self.assertEqual(len(probes), 2)
-            # 跨三个库收集序列，确保 probe 不是任何库的精确拷贝。
+            # Collect sequences across all three libraries so the probe check is not limited to a single motif percentage.
             all_reference_sequences = set()
             for percentage in (0, 50, 90):
                 all_reference_sequences.update(
@@ -496,7 +583,8 @@ class InputPreparationTests(unittest.TestCase):
                 )
             for probe in probes:
                 with self.subTest(probe=probe["query_id"]):
-                    # probe 不是精确命中，但与源序列恰好差一次编辑。
+                    # A probe is guaranteed not to be an exact copy of any reference and to be exactly one edit away from its source.
+                    #It is not guaranteed to have zero matches at an arbitrary threshold, so no such claim is asserted.
                     self.assertNotIn(probe["sequence"], all_reference_sequences)
                     self.assertEqual(probe["source_distance"], "1")
                     self.assertEqual(
@@ -504,16 +592,18 @@ class InputPreparationTests(unittest.TestCase):
                     )
 
     def test_real_data_preparation(self):
-        """真实数据清洗器的端到端检查（使用伪造的 VDJdb 小样本）。
+        """End-to-end check of the real-data cleaner using a fake VDJdb sample.
 
-        输入覆盖重复、非法氨基酸、空 CDR3、错误链、错误物种五类情况；
-        不需要下载真实 VDJdb，也能验证清洗、去重、注释保留和子集生成。
+        The seven input rows cover duplicate sequences, an invalid amino
+        acid, an empty CDR3, a wrong chain, and a wrong species. This
+        exercises filtering, normalization, deduplication, annotation
+        retention, nested subset generation, and query sampling without
+        downloading VDJdb.
         """
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "vdjdb.slim.txt"
-            # 7 行原始记录：2 行同序列、1 行非法字符、1 行空 CDR3、
-            # 1 行错误链、1 行错误物种。
+            # Seven raw rows: two copies of the same sequence, one invalid character, one empty CDR3, one wrong chain, one wrong species.
             source.write_text(
                 "gene\tspecies\tcdr3\tweight\n"
                 "TRB\tHomoSapiens\tCASS\t1\n"
@@ -537,7 +627,7 @@ class InputPreparationTests(unittest.TestCase):
             )
             prepare_real(args, output)
 
-            # 清洗报告必须准确区分“目标物种/链过滤后”和“通过 CDR3 检查”。
+            # The cleaning report must distinguish rows that passed the species/chain filter from rows that passed CDR3 validation.
             report = json.loads(
                 (output / "cleaning_report.json").read_text(encoding="utf-8")
             )
@@ -550,16 +640,16 @@ class InputPreparationTests(unittest.TestCase):
             self.assertEqual(counts["missing_cdr3"], 1)
             self.assertEqual(counts["invalid_amino_acid"], 1)
             self.assertEqual(counts["excluded_species_or_chain"], 2)
-            # 输入指纹用于实验可追溯，SHA-256 十六进制长度固定为 64。
+            # The input fingerprint supports experiment traceability; a SHA-256 hex digest is always 64 characters long.
             self.assertEqual(len(report["input_sha256"]), 64)
 
-            # 去重后只保留 CASS 和 CATS；最小子集大小等于全量时两者一致。
+            # Deduplication must leave only CASS and CATS. When the smallest subset size equals the full database, the subset and the full reference set must be identical.
             references = read_sequences(output / "reference_all.tsv", "reference_id")
             self.assertEqual(sorted(references.values()), ["CASS", "CATS"])
             subset = read_sequences(output / "reference_n2.tsv", "reference_id")
             self.assertEqual(subset, references)
 
-            # 注释按参考 ID 聚合；重复的 CASS 应保留两条原始记录。
+            # Annotations are grouped by reference ID. The duplicated CASS sequence must retain both original records rather than keeping only the first one.
             with gzip.open(output / "annotations.jsonl.gz", "rt", encoding="utf-8") as handle:
                 annotations = [json.loads(line) for line in handle]
             self.assertEqual(len(annotations), 2)
@@ -567,7 +657,8 @@ class InputPreparationTests(unittest.TestCase):
             cass_id = next(rid for rid, sequence in references.items() if sequence == "CASS")
             self.assertEqual(len(records_by_id[cass_id]), 2)
 
-            # 查询应是参考序列的精确拷贝，距离为 0、来源 ID 可追溯。
+            # Queries should be exact copies of reference sequences with
+            # distance zero and a traceable source ID.
             query_rows = read_rows(output / "queries.tsv")
             self.assertEqual(len(query_rows), 2)
             for row in query_rows:
@@ -576,16 +667,17 @@ class InputPreparationTests(unittest.TestCase):
                 self.assertEqual(references[row["source_id"]], row["sequence"])
                 self.assertEqual(row["source_distance"], "0")
 
-            # 被排除的目标行只包含两类 CDR3 问题，不含物种/链过滤行。
+            # Excluded target rows contain only CDR3 problems. Rows removed by the species/chain filter must not leak into this file, or the cleaning report would double-count them.
             excluded = read_rows(output / "excluded_target_rows.tsv")
             self.assertEqual(
                 sorted(row["reason"] for row in excluded),
                 ["invalid_amino_acid", "missing_cdr3"],
             )
-            # 两条长度 4 的序列都在 8-30 的推荐范围之外。
+            # Both length-4 sequences fall outside the recommended 8-30 range, so both must be flagged for manual review.
             self.assertEqual(len(read_rows(output / "length_review_flags.tsv")), 2)
 
 
 if __name__ == "__main__":
-    # 直接运行 test.py 时以详细模式输出每个用例名。
+    # Running this file directly uses verbose output so every test name
+    # and subtest appears in the console.
     unittest.main(verbosity=2)
