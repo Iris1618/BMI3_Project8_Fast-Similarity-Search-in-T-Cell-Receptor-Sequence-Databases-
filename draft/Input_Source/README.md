@@ -1,175 +1,167 @@
 # Input preparation
 
-This folder prepares inputs for the group's TCR search program.
-Run the commands below from the **repository root**, using Python 3.10 or newer.
-No third-party packages are needed.
-
-## Read the code in this order
-
-1. common.py: check amino-acid letters, assign IDs and save files.
-2. prepare_real.py: read VDJdb, clean sequences and create nested subsets.
-3. prepare_synthetic.py: generate references, edit templates and create GQE queries.
-
-The scripts use ordinary loops, lists, dictionaries and sets. A set records values
-already seen so duplicate checks stay fast. There are no classes or comprehensions.
-
-| Python standard-library module | Why it is used |
-| --- | --- |
-| csv | Write tab-separated tables. |
-| json | Save annotations, edit histories and settings. |
-| random | Generate repeatable data using fixed seeds. |
-| argparse | Read settings supplied on the command line. |
-| pathlib | Work with file and directory paths. |
-| sys | Record the Python version. |
-| gzip | Save the existing compressed annotation format. |
-| hashlib | Keep existing sequence IDs and record the source-file checksum. |
-
-The synthetic script borrows the group's basic DP function from
-draft/Verification/verification_basic.py to check each query against its source.
-It does not calculate the complete retrieval truth.
+Run the commands below from the repository root. Python 3.9 or later and the
+Python standard library are sufficient. The synthetic script imports the group's
+`verification_basic` function to check each edited query against its source template.
 
 ## Real data
 
-Download and extract the [VDJdb 2026-06-03 release](https://github.com/antigenomics/vdjdb-db/releases/download/2026-06-03/vdjdb-2026-06-03.zip).
-Use vdjdb.slim.txt as the input. See the [VDJdb paper](https://doi.org/10.1093/nar/gkx760).
+Download the [VDJdb 2026-06-03 release](https://github.com/antigenomics/vdjdb-db/releases/download/2026-06-03/vdjdb-2026-06-03.zip)
+and extract it. Use `vdjdb.slim.txt` as the input. The release is described in the
+[VDJdb paper](https://doi.org/10.1093/nar/gkx760).
 
-~~~bash
-python3 -m draft.Input_Source.prepare_real \
+```bash
+python3 -m Input_Source.prepare_real \
   --input /path/to/vdjdb-2026-06-03/vdjdb.slim.txt \
   --out data/real \
   --sizes 1000 5000 10000 --queries 100 --seed 20261111
-~~~
+```
 
-The defaults select human TRB records. Missing or invalid CDR3 sequences are
-excluded; outer whitespace is removed and lowercase letters become uppercase.
-Identical sequences are grouped while every original annotation row is retained.
-Lengths outside 8-30 aa are flagged and retained.
+The script selects human TRB records, removes missing or invalid CDR3 sequences,
+and deduplicates by CDR3 amino acid sequence. It trims outer whitespace and uses
+uppercase letters. All original annotation rows remain linked to their reference ID.
+Lengths outside 8-30 aa are flagged for review and retained.
 
-For the pinned release, expect 120,575 valid human TRB records and 111,414 unique
-sequences. The script shuffles once and takes prefixes to make nested reference
-subsets. Queries are sampled from the smallest subset, so every subset contains
-their exact matches. Species and chain can be changed with --species and --gene.
+The expected counts for this release are 120,575 valid human TRB records and
+111,414 unique sequences. Nested subsets share one shuffled sequence order.
+The queries are copied from the smallest subset, so every subset contains their
+exact matches. `--species` and `--gene` can be set for another source selection.
+
+The default command prints
+
+```text
+Kept 120575 records and 111414 unique sequences
+```
+
+The reference sizes and query count are configurable. We provide the current
+settings as a starting dataset. If the group needs larger datasets, change the
+parameters and regenerate the inputs.
+
+The 1,000/5,000/10,000 sizes and 100 queries are practical initial benchmark
+settings. Compare them using the same queries and record the chosen parameters.
 
 | Output | Contents |
 | --- | --- |
-| reference_all.tsv | All unique reference IDs and sequences. |
-| reference_n*.tsv | Nested reference subsets of the requested sizes. |
-| queries.tsv | Exact-copy queries with their source IDs. |
-| annotations.jsonl.gz | All original annotation records grouped by reference ID. |
-| excluded_target_rows.tsv | Missing or invalid target CDR3 records and their reasons. |
-| length_distribution.tsv | Unique sequence counts by length. |
-| length_review_flags.tsv | Sequences outside the review length range. |
-| cleaning_report.json | Counts, settings, source checksum and Python version. |
-
-The reference sizes and query count are parameters. We provide the current
-settings as a starting dataset. If the group needs larger datasets, change the
-parameters and regenerate the inputs. The sizes 1,000/5,000/10,000 and 100 queries
-are practical initial settings; record the parameters used in each experiment.
+| `reference_all.tsv` | All unique reference IDs and sequences. |
+| `reference_n*.tsv` | Nested reference subsets of the requested sizes. |
+| `queries.tsv` | Exact-copy queries with their source IDs. |
+| `annotations.jsonl.gz` | Each reference ID and its full original annotation records. |
+| `excluded_target_rows.tsv` | Missing or invalid CDR3 rows among the selected species and chain. |
+| `length_distribution.tsv` | Unique sequence counts by length. |
+| `length_review_flags.tsv` | Sequences outside the review length range. |
+| `cleaning_report.json` | Source filename and SHA-256, counts, parameters and Python version. |
 
 ## Synthetic data
 
-~~~bash
-python3 -m draft.Input_Source.prepare_synthetic \
+```bash
+python3 -m Input_Source.prepare_synthetic \
   --out data/synthetic \
   --size 1000 --lengths 8 12 18 --motif-percentages 0 50 90 \
-  --anchors 5 --max-edits 3 --probe-count 10
-~~~
+  --max-edits 3 --anchors 5 --probe-count 10
+```
 
-The defaults create nine reference libraries: three lengths multiplied by three
-GQE proportions, with 1,000 unique references in each. References start with C
-and end with F. GQE is placed centrally in motif-positive sequences. Proportions
-are rounded to whole sequence counts and must leave enough background templates.
-The sequence length must provide enough distinct motif-positive combinations.
+Each library has unique sequences starting with C and ending with F.
+`L12_motif050` contains length-12 references with 50% containing GQE. GQE is
+placed centrally in the motif-positive pool. Percentages are rounded to a whole
+number of sequences. The requested proportions must leave at least `--anchors`
+background sequences in each library, and the motif-positive pool must fit the
+available sequence combinations. Increase the length when generating larger pools.
 
-Each library has 61 ordinary queries: 5 exact copies, 15 substitution queries,
-15 insertion queries, 15 deletion queries, 6 short queries and 5 candidate negatives.
-The five background templates are shared across proportions of the same length.
-The default synthetic seed is 20262111.
+With the defaults, each of nine libraries has 1,000 references and 61 queries.
+Five common background templates produce 5 exact copies, 15 substitutions,
+15 insertions and 15 deletions. Another 6 queries have lengths 1-3, and 5
+random W/Y queries are labelled `candidate_no_match` for the benchmark member
+to check against the whole reference library. Edit positions use zero-based
+indices in the sequence at that step. `source_distance` applies to the source
+template. Use that reference-query pair when checking a distance boundary.
 
-- --anchors chooses the number of background templates.
-- --max-edits sets the largest requested source-query distance during generation.
-- --probe-count sets the number of common GQE queries per length; use 0 to omit them.
+These are amino acid stress tests with edits at interior positions. They test
+search behaviour under controlled changes. V/D/J junction positions are not
+inferred during generation.
 
-Each common GQE query changes one residue outside GQE in a shared positive
-template. It is absent as an exact sequence from every reference library.
-Use the same motif_probes/L12/queries.tsv file against all three length-12 libraries;
-likewise use L8 and L18 against the corresponding lengths. The default probe seed
-is 20261113. For length 12, k=3, d=2 and spread placement select GQE as one seed.
+The `motif_probes/L8`, `L12` and `L18` directories each contain 10 common GQE
+queries. A probe changes one residue outside GQE in a template shared by all
+positive-proportion libraries. Each probe is absent as an exact sequence from
+every library. Use the same probe file against all three proportions of that length.
+Set `--probe-count 0` to omit probes. The default synthetic seed is 20262111,
+and the probe seed is 20261113. Both seeds are configurable.
 
-| Output | Contents |
+| Output in each `L*_motif*` directory | Contents |
 | --- | --- |
-| L*_motif*/reference.tsv | Reference IDs and sequences for one condition. |
-| L*_motif*/queries.tsv | Ordinary queries and source information. |
-| L*_motif*/edit_history.jsonl | Operations, zero-based positions, old and new residues. |
-| L*_motif*/generation_report.json | Actual motif count and query categories. |
-| motif_probes/L*/queries.tsv | Common GQE queries for one length. |
-| generation_report.json | Settings for the complete synthetic generation run. |
+| `reference.tsv` | Reference IDs and sequences for this condition. |
+| `queries.tsv` | Generated queries and source information. |
+| `edit_history.jsonl` | The operations used to construct each template-derived query. |
+| `generation_report.json` | Reference length, actual motif count and query categories. |
 
-The edits are amino-acid stress tests at interior positions. V/D/J junction
-positions are not inferred. source_distance describes the distance to the source
-template, not the distance to every reference. candidate_no_match queries still
-need exhaustive validation at the chosen search threshold.
+`generation_report.json` in the synthetic output root records the complete
+generation settings. `motif_probes/L*/queries.tsv` supplies the common queries.
+The short, hand-checkable files in `Input_Source/examples/` can be used to check
+fallback behaviour with true matches.
 
-## Handoff to search and benchmark
+For example, generate a smaller practice set with
 
-Reference TSV columns: reference_id, sequence.
-Query TSV columns: query_id, sequence, category, source_id, source_sequence,
-applied_edits, source_distance. Empty metadata means it does not apply.
-The search reader accepts these extra query columns.
+```bash
+python3 -m Input_Source.prepare_synthetic \
+  --out data/practice --size 100 --lengths 12 \
+  --motif-percentages 0 50 90 --probe-count 5
+```
 
-~~~bash
-python3 TCR_Search/main.py search \
+Use a fresh output directory for each run. Files are published after preparation
+finishes. Fixed seeds and input files give reproducible sequence TSVs. These
+scripts prepare inputs for the group's exhaustive search and benchmark stage.
+Existing truth files must be checked against the exact query and reference files
+used in each run.
+
+## Data fields and handoff
+
+Reference TSV files contain `reference_id` and `sequence`. Query TSV files contain
+`query_id` and `sequence`, followed by `category`, `source_id`, `source_sequence`,
+`applied_edits` and `source_distance`. Empty metadata means it does not apply.
+IDs are stable within the files and reference IDs are derived from the sequence.
+
+The group's index can read the generated files directly. For example
+
+```bash
+python3 Inverted_Index/inverted_index.py \
   --reference data/synthetic/L12_motif050/reference.tsv \
   --queries data/synthetic/motif_probes/L12/queries.tsv \
-  --d 2 --k 3 --strategy spread
+  --k 3 --d 2 --strategy spread --output candidates.jsonl
+```
 
-python3 TCR_Search/main.py validate \
-  --reference data/synthetic/L12_motif050/reference.tsv \
-  --queries data/synthetic/motif_probes/L12/queries.tsv \
-  --d 2 --k 3 --output results/check_L12_motif050.csv
-~~~
+For the length-12 GQE experiment, `spread`, k=3 and d=2 select starts 0, 4 and 9.
+The seed at start 4 is GQE. Record the actual seeds and candidate counts when
+comparing the three motif proportions.
 
-Repeat with motif000 and motif090 while keeping the query file and search settings
-the same. Benchmark candidate counts, query time and index costs.
+## Pseudocode
 
-Use a fresh output directory for each generation run. Files are written directly
-to that directory. If generation fails after writing starts, the directory may
-contain incomplete files; use a new directory for the next attempt.
-Fixed seeds and the same source file reproduce the sequence TSVs and IDs.
-Check supplied truth files against the exact references and queries used.
-
-The current search application leaves annotations empty. The saved real-data
-annotations can be joined to matches by reference_id after retrieval.
-
-## English pseudocode
-
-~~~text
-READ VDJdb records
-SELECT the requested species and chain
-CLEAN and CHECK each CDR3 sequence
-GROUP identical sequences and retain all annotations
-SHUFFLE the unique sequences with a fixed seed
+```text
+READ the VDJdb column names
+FOR each record
+    SELECT the requested species and chain
+    CLEAN and CHECK the CDR3 amino acid sequence
+    GROUP identical sequences and preserve every annotation record
+SORT the unique sequences and shuffle using a fixed seed
 WRITE nested reference subsets
 SAMPLE queries from the smallest subset
-SAVE counts and preparation settings
-~~~
+WRITE the preparation settings and counts
+```
 
-~~~text
-FOR each sequence length
-    GENERATE pools with and without GQE
-    FOR each requested GQE proportion
-        MIX the pools and SAVE the reference library
-        COPY templates and APPLY substitutions, insertions and deletions
-        CHECK each query against its source using the group's verifier
-        ADD short queries and candidate negatives
-        SAVE queries, edit histories and settings
-    CHANGE residues outside GQE in shared templates
-    REJECT queries identical to any reference
-    SAVE the common GQE queries
-~~~
+```text
+FOR each reference length
+    GENERATE unique background and GQE-containing sequence pools
+    FOR each requested GQE percentage
+        SELECT sequences from the two pools and write the reference library
+        COPY common templates and apply substitutions, insertions and deletions
+        CHECK the source-query distances using the group's verifier
+        ADD short queries and candidate negative queries
+        SAVE queries, edit histories and generation settings
+    GENERATE one common GQE probe set from shared positive templates
+    CHECK that each probe is absent as an exact sequence from every library
+    WRITE the common probes
+```
 
 ## Contribution and assistance
 
 This directory covers the input/source preparation contribution. AI assistance
-was used to draft and simplify these scripts and this README. Record that
-assistance in the coursework disclosure and follow the module's AI rules.
+was used to draft the input preparation scripts and this README. The group should
+record this assistance in its coursework disclosure and follow the module's AI rules.
