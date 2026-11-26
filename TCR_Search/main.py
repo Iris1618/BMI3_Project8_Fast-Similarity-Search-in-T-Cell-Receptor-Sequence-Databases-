@@ -9,13 +9,12 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 
 from tcr_search.benchmark import benchmark, memory_comparison, validation_rows, write_csv
-from tcr_search.data_input import read_sequences
+from tcr_search.data_input import read_annotations, read_records, read_sequences
 from tcr_search.exhaustive_search import exhaustive_matches
 from tcr_search.inverted_index import InvertedIndex
 from tcr_search.verification import verify
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-EXAMPLES = PROJECT_ROOT / "data" / "examples"
 RESULTS = PROJECT_ROOT / "results"
 
 
@@ -42,13 +41,13 @@ def integer_at_least(minimum):
 def build_parser():
     parser = argparse.ArgumentParser(
         description="Search TCR sequences within an inclusive edit-distance threshold.",
-        epilog="With no arguments, search the examples with d=1 and k=3.",
+        epilog="Choose a command, then specify --reference and --queries. Use search --help for details.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("search", "validate", "benchmark", "memory"):
         command = commands.add_parser(name)
-        command.add_argument("--reference", type=Path, default=EXAMPLES / "reference.tsv")
-        command.add_argument("--queries", type=Path, default=EXAMPLES / "queries.tsv")
+        command.add_argument("--reference", type=Path, required=True, help="reference TSV to search")
+        command.add_argument("--queries", type=Path, required=True, help="query TSV to read")
         command.add_argument("--d", "--distance", type=integer_at_least(0), default=1)
         command.add_argument("--k", type=integer_at_least(1), default=3)
         command.add_argument("--strategy", choices=("spread", "prefix"), default="spread")
@@ -56,6 +55,11 @@ def build_parser():
         command.add_argument("--output", type=Path, help="new output file; existing files are not overwritten")
         if name == "search":
             command.add_argument("--method", choices=("indexed", "exhaustive"), default="indexed")
+            command.add_argument(
+                "--annotations", type=Path,
+                help="annotation JSONL or JSONL.gz; defaults to annotations.jsonl.gz or "
+                     "annotations.jsonl beside the reference TSV when present",
+            )
         if name == "benchmark":
             command.add_argument("--repeats", type=integer_at_least(2), default=5)
             command.add_argument("--metadata", type=Path)
@@ -73,7 +77,7 @@ def prepare_outputs(paths):
         path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def run_search(args, references, queries):
+def run_search(args, references, query_records, annotations):
     """Build the index once, search every query, and output matching records."""
     index = InvertedIndex(references, args.k) if args.method == "indexed" else None
     output = sys.stdout
@@ -82,14 +86,18 @@ def run_search(args, references, queries):
         output = args.output.open("x", encoding="utf-8", newline="\n")
     total_matches = 0
     try:
-        for query_id, query in queries.items():
+        for query_id, record in query_records.items():
+            query = record["sequence"]
             matches = (indexed_matches(index, query, args.d, args.strategy) if index is not None
                        else exhaustive_matches(query, references, args.d))
             row = {
                 "query_id": query_id,
+                "query_sequence": query,
+                "query_metadata": {key: value for key, value in record.items()
+                                   if key not in ("query_id", "sequence")},
                 "matches": [
                     {"reference_id": rid, "sequence": references[rid],
-                     "distance": matches[rid], "annotations": []}
+                     "distance": matches[rid], "annotations": annotations.get(rid, [])}
                     for rid in sorted(matches)
                 ],
             }
@@ -99,23 +107,37 @@ def run_search(args, references, queries):
         if output is not sys.stdout:
             output.close()
     print(f"method={args.method}; references={len(references)}; "
-          f"queries={len(queries)}; matches={total_matches}", file=sys.stderr)
+          f"queries={len(query_records)}; matches={total_matches}", file=sys.stderr)
     return 0
 
 
 def main(argv=None):
     parser = build_parser()
     argv = list(sys.argv[1:] if argv is None else argv)
-    args = parser.parse_args(argv or ["search"])
+    if not argv:
+        parser.print_help()
+        return 0
+    args = parser.parse_args(argv)
     try:
         references = read_sequences(args.reference, "reference_id")
-        queries = read_sequences(args.queries, "query_id")
+        query_records = read_records(args.queries, "query_id")
         if args.limit is not None:
-            queries = dict(list(queries.items())[:args.limit])
-        if not references or not queries:
+            query_records = dict(list(query_records.items())[:args.limit])
+        if not references or not query_records:
             raise ValueError("reference and query files must not be empty")
         if args.command == "search":
-            return run_search(args, references, queries)
+            annotations_path = args.annotations
+            if annotations_path is None:
+                annotations_path = next(
+                    (args.reference.parent / name
+                     for name in ("annotations.jsonl.gz", "annotations.jsonl")
+                     if (args.reference.parent / name).is_file()), None,
+                )
+            annotations = (read_annotations(annotations_path, references)
+                           if annotations_path is not None else {})
+            return run_search(args, references, query_records, annotations)
+
+        queries = {qid: record["sequence"] for qid, record in query_records.items()}
 
         output = args.output if args.output is not None else RESULTS / f"{args.command}.csv"
         if args.command == "validate":
