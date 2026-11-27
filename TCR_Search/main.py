@@ -8,7 +8,7 @@ from pathlib import Path
 # Keep the project folders free of automatically generated __pycache__ files.
 sys.dont_write_bytecode = True
 
-from tcr_search.benchmark import benchmark, memory_comparison, validation_rows, write_csv
+from tcr_search.benchmark import benchmark, memory_comparison, summarize_benchmarks, validation_rows, write_csv
 from tcr_search.data_input import read_annotations, read_records, read_sequences
 from tcr_search.exhaustive_search import exhaustive_matches
 from tcr_search.inverted_index import InvertedIndex
@@ -44,15 +44,21 @@ def build_parser():
         epilog="Choose a command, then specify --reference and --queries. Use search --help for details.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
+    summary = commands.add_parser("summarize", help="combine saved benchmark reports into one CSV")
+    summary.add_argument("--input-dir", type=Path, required=True, help="directory of benchmark CSV/metadata pairs")
+    summary.add_argument("--output", type=Path, required=True, help="new summary CSV; existing files are not overwritten")
     for name in ("search", "validate", "benchmark", "memory"):
         command = commands.add_parser(name)
-        command.add_argument("--reference", type=Path, required=True, help="reference TSV to search")
+        command.add_argument("--reference", type=Path, required=True,
+                             nargs="+" if name == "benchmark" else None,
+                             help="reference TSV; benchmark accepts one or more files")
         command.add_argument("--queries", type=Path, required=True, help="query TSV to read")
         command.add_argument("--d", "--distance", type=integer_at_least(0), default=1)
         command.add_argument("--k", type=integer_at_least(1), default=3)
         command.add_argument("--strategy", choices=("spread", "prefix"), default="spread")
         command.add_argument("--limit", type=integer_at_least(1))
-        command.add_argument("--output", type=Path, help="new output file; existing files are not overwritten")
+        outputs = command.add_mutually_exclusive_group()
+        outputs.add_argument("--output", type=Path, help="new output file; existing files are not overwritten")
         if name == "search":
             command.add_argument("--method", choices=("indexed", "exhaustive"), default="indexed")
             command.add_argument(
@@ -61,6 +67,8 @@ def build_parser():
                      "annotations.jsonl beside the reference TSV when present",
             )
         if name == "benchmark":
+            outputs.add_argument("--output-dir", type=Path,
+                                 help="empty directory for benchmark reports and an automatic summary.csv")
             command.add_argument("--repeats", type=integer_at_least(2), default=5)
             command.add_argument("--metadata", type=Path)
     return parser
@@ -75,6 +83,53 @@ def prepare_outputs(paths):
             raise ValueError(f"output already exists: {path}; choose a new --output path")
     for path in paths:
         path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def run_benchmarks(args):
+    """Benchmark each reference file, then summarize a batch in one directory."""
+    if len(args.reference) > 1 and args.output_dir is None:
+        raise ValueError("multiple reference files require --output-dir")
+    if args.output_dir is not None and args.metadata is not None:
+        raise ValueError("--metadata is only used with a single --output file")
+    if args.output_dir is not None and args.output_dir.exists() and any(args.output_dir.iterdir()):
+        raise ValueError("output directory must be empty; choose a new --output-dir")
+
+    # Load the same queries once for all reference databases.
+    queries = read_sequences(args.queries, "query_id")
+    if args.limit is not None:
+        queries = dict(list(queries.items())[:args.limit])
+    databases = [read_sequences(path, "reference_id") for path in args.reference]
+    if not queries or any(not references for references in databases):
+        raise ValueError("reference and query files must not be empty")
+    if args.output_dir is not None and len({len(references) for references in databases}) > 1:
+        raise ValueError("reference files must have the same size for a batch summary")
+
+    # Check every output path before starting the benchmarks.
+    if args.output_dir is not None:
+        output_files = [args.output_dir / (path.stem.removeprefix("reference_") + ".csv")
+                        for path in args.reference]
+    else:
+        output_files = [args.output if args.output is not None else RESULTS / "benchmark.csv"]
+    metadata_files = [args.metadata if args.metadata is not None else
+                      path.with_name(path.stem + ".metadata.json") for path in output_files]
+    summary_file = args.output_dir / "summary.csv" if args.output_dir is not None else None
+    prepare_outputs(output_files + metadata_files + ([summary_file] if summary_file else []))
+
+    for reference_path, references, output, metadata_path in zip(
+            args.reference, databases, output_files, metadata_files):
+        metadata, rows = benchmark(references, queries, args.d, args.k, args.strategy,
+                                   args.repeats, indexed_matches)
+        metadata.update(reference_path=str(reference_path.resolve()), query_path=str(args.queries.resolve()))
+        write_csv(output, rows)
+        with metadata_path.open("x", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+        print(f"Benchmark results: {output}; metadata: {metadata_path}")
+
+    if summary_file is not None:
+        write_csv(summary_file, summarize_benchmarks(args.output_dir))
+        print(f"Summary: {summary_file}")
+    return 0
 
 
 def run_search(args, references, query_records, annotations):
@@ -119,6 +174,14 @@ def main(argv=None):
         return 0
     args = parser.parse_args(argv)
     try:
+        if args.command == "summarize":
+            rows = summarize_benchmarks(args.input_dir)
+            prepare_outputs([args.output])
+            write_csv(args.output, rows)
+            print(f"Summarized {len(rows)} benchmark runs: {args.output}")
+            return 0
+        if args.command == "benchmark":
+            return run_benchmarks(args)
         references = read_sequences(args.reference, "reference_id")
         query_records = read_records(args.queries, "query_id")
         if args.limit is not None:
@@ -156,18 +219,6 @@ def main(argv=None):
             print(f"Memory results: {output} (incremental Python allocations; not process RSS)")
             return 0
 
-        metadata_path = args.metadata if args.metadata is not None else output.with_name(
-            output.stem + ".metadata.json")
-        prepare_outputs([output, metadata_path])
-        metadata, rows = benchmark(references, queries, args.d, args.k, args.strategy,
-                                   args.repeats, indexed_matches)
-        metadata.update(reference_path=str(args.reference.resolve()), query_path=str(args.queries.resolve()))
-        write_csv(output, rows)
-        with metadata_path.open("x", encoding="utf-8") as handle:
-            json.dump(metadata, handle, indent=2, ensure_ascii=False)
-            handle.write("\n")
-        print(f"Benchmark results: {output}; metadata: {metadata_path}")
-        return 0
     except (OSError, ValueError) as error:
         parser.exit(2, f"error: {error}\n")
     except KeyboardInterrupt:

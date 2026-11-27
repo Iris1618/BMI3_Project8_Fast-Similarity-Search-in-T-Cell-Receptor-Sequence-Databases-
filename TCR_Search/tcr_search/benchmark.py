@@ -13,6 +13,7 @@ import platform
 import statistics
 import time
 import tracemalloc
+from pathlib import Path
 
 from .exhaustive_search import exhaustive_matches
 from .inverted_index import InvertedIndex
@@ -191,3 +192,70 @@ def write_csv(path, rows):
         writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
         writer.writeheader()
         writer.writerows(rows)
+
+
+def summarize_benchmarks(input_dir):
+    """Return one summary row for each saved benchmark run."""
+    metadata_files = sorted(Path(input_dir).glob("*.metadata.json"))
+    if not metadata_files:
+        raise ValueError(f"no benchmark metadata files found in {input_dir}")
+
+    summary_rows = []
+    first_metadata = None
+    settings = ("query_path", "query_ids", "query_count", "reference_count",
+                "d", "k", "strategy", "repeats")
+
+    for metadata_file in metadata_files:
+        # Read the metadata and its matching benchmark CSV.
+        with metadata_file.open(encoding="utf-8-sig") as file:
+            metadata = json.load(file)
+        csv_file = metadata_file.with_name(
+            metadata_file.name.removesuffix(".metadata.json") + ".csv")
+        with csv_file.open(encoding="utf-8-sig", newline="") as file:
+            method_rows = list(csv.DictReader(file))
+        methods = {row["method"]: row for row in method_rows}
+        if len(method_rows) != 2 or set(methods) != {"exhaustive", "indexed"}:
+            raise ValueError(f"{csv_file}: expected one indexed and one exhaustive row")
+
+        # Compare runs that use the same queries and experiment settings.
+        if first_metadata is None:
+            first_metadata = metadata
+        for setting in settings:
+            if metadata[setting] != first_metadata[setting]:
+                raise ValueError(f"{metadata_file}: benchmark inputs differ in {setting}")
+
+        # Calculate speedup and the average number of candidates per query.
+        exhaustive_time = float(methods["exhaustive"]["median"])
+        indexed_time = float(methods["indexed"]["median"])
+        query_count = metadata["query_count"]
+        candidate_count = metadata["candidate_count_total"]
+        eligible_count = metadata["length_eligible_count_total"]
+        speedup = exhaustive_time / indexed_time if indexed_time else None
+        reduction = 100 * (1 - candidate_count / eligible_count) if eligible_count else None
+
+        # Get the GQE percentage from names such as reference_gqe_50pct.
+        reference_name = Path(metadata["reference_path"]).stem
+        percentage = reference_name.removeprefix("reference_gqe_").removesuffix("pct")
+        percentage = int(percentage) if percentage.isdigit() else None
+
+        summary_rows.append({
+            "reference": reference_name, "gqe_percentage": percentage,
+            "reference_count": metadata["reference_count"], "query_count": query_count,
+            "d": metadata["d"], "k": metadata["k"], "strategy": metadata["strategy"],
+            "exhaustive_median_ms_per_query": exhaustive_time,
+            "indexed_median_ms_per_query": indexed_time,
+            "search_speedup": speedup,
+            "average_candidates_per_query": candidate_count / query_count,
+            "dp_reduction_percent": reduction,
+            "index_build_median_ms": metadata["index_build_median_ms"],
+            "exhaustive_incremental_peak_python_mib":
+                int(methods["exhaustive"]["incremental_peak_python_bytes"]) / 1024**2,
+            "indexed_incremental_peak_python_mib":
+                int(methods["indexed"]["incremental_peak_python_bytes"]) / 1024**2,
+            "benchmark_csv": str(csv_file.resolve()),
+        })
+
+    # Put the GQE runs in percentage order, followed by other reference names.
+    summary_rows.sort(key=lambda row: (
+        row["gqe_percentage"] is None, row["gqe_percentage"] or 0, row["reference"]))
+    return summary_rows

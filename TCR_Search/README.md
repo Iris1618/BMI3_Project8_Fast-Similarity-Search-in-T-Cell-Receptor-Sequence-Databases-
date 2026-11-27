@@ -23,7 +23,12 @@ TCR_Search/
 │   │   ├── reference_n10000.tsv
 │   │   ├── queries.tsv
 │   │   └── annotations.jsonl.gz
-│   └── synthetic/             # Empty for now
+│   └── synthetic/
+│       └── length12_gqe_frequency/
+│           ├── queries.tsv
+│           ├── reference_gqe_0pct.tsv
+│           ├── reference_gqe_50pct.tsv
+│           └── reference_gqe_90pct.tsv
 ├── results/                 # Generated output files
 ├── tests/                   # Input and search tests
 └── README.md
@@ -33,7 +38,7 @@ TCR_Search/
 
 Run these commands from the `TCR_Search` directory. Relative paths are resolved from your current working directory.
 
-Every command (`search`, `validate`, `benchmark`, or `memory`) requires `--reference` and `--queries`. Running `python main.py` without arguments displays help.
+`search`, `validate`, `benchmark`, and `memory` require `--reference` and `--queries`. `summarize` reads saved benchmark reports instead. Running `python main.py` without arguments displays help.
 
 ### 1. Search
 
@@ -58,6 +63,50 @@ python main.py benchmark --reference data/real/reference_n1000.tsv --queries dat
 Both methods use the same verifier. Timing is repeated five times by default, and index construction time is reported separately. Memory is measured in a separate run after timing.
 
 This command saves `results/benchmark_real_n1000.csv` and `results/benchmark_real_n1000.metadata.json`. Without `--output`, the default names are `results/benchmark.csv` and `results/benchmark.metadata.json`. Search timing excludes data loading, validation, annotation attachment, and file output. Memory figures cover incremental Python allocations after input loading, including index construction for indexed search; they are not total process memory. Benchmarking does not load annotations.
+
+To compare the three synthetic GQE databases and generate all reports plus a summary in one command, run this in PowerShell:
+
+```powershell
+python main.py benchmark `
+  --queries data/synthetic/length12_gqe_frequency/queries.tsv `
+  --reference data/synthetic/length12_gqe_frequency/reference_gqe_0pct.tsv `
+              data/synthetic/length12_gqe_frequency/reference_gqe_50pct.tsv `
+              data/synthetic/length12_gqe_frequency/reference_gqe_90pct.tsv `
+  --d 2 --k 3 --strategy spread --repeats 5 `
+  --output-dir results/length12_comparison
+```
+
+The command searches each reference database using the same queries and settings, benchmarks both methods, then automatically writes `summary.csv`. No separate summary command is needed. The output directory is created if it does not exist and must be empty if it already exists. Reference databases must have the same number of sequences for this comparison. To run another comparison, choose a new `--output-dir`.
+
+Starting with an empty `results` directory, this produces exactly:
+
+```text
+results/length12_comparison/
+├── gqe_0pct.csv
+├── gqe_0pct.metadata.json
+├── gqe_50pct.csv
+├── gqe_50pct.metadata.json
+├── gqe_90pct.csv
+├── gqe_90pct.metadata.json
+└── summary.csv
+```
+
+Use `--output` for one benchmark CSV, or `--output-dir` for benchmark reports and an automatic summary. These options cannot be combined; custom `--metadata` paths apply only to single-file output.
+
+The summary contains one row per run, sorted by the GQE percentage labelled in the reference filename (`reference_gqe_0pct.tsv`, `reference_gqe_50pct.tsv`, `reference_gqe_90pct.tsv`). These percentages are filename labels, not values measured by the summary command. Other reference filenames can also be summarized, with the percentage left blank.
+
+| Summary column | Meaning |
+|---|---|
+| `exhaustive_median_ms_per_query`, `indexed_median_ms_per_query` | Median search time per query for each method |
+| `search_speedup` | Exhaustive median divided by indexed median; excludes index construction |
+| `average_candidates_per_query` | Total indexed candidates divided by query count |
+| `dp_reduction_percent` | Candidate reduction relative to all length-eligible references, as a percentage |
+| `index_build_median_ms` | Median time to build one index |
+| `exhaustive_incremental_peak_python_mib`, `indexed_incremental_peak_python_mib` | Incremental peak Python allocations in MiB; indexed includes index construction, not process RSS |
+
+Each row also records the reference, reference/query counts, `d`, `k`, strategy, and source CSV path. The command checks that runs use the same recorded query path and IDs, query/reference counts, `d`, `k`, strategy, and repeat count. Use reports produced with the same query file contents and environment; the summary does not check historical file contents or machine details.
+
+The supplied 61 synthetic queries cover exact copies, substitutions, insertions, deletions, short queries, and no-match cases. Under `k=3`, `d=2`, and `spread`, none selects GQE as a seed. The summary therefore shows performance across the three reference databases; a causal test of the common GQE seed requires queries that actually select that seed.
 
 ## Input and Output
 
