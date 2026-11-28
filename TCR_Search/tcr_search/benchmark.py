@@ -18,14 +18,22 @@ from pathlib import Path
 from .exhaustive_search import exhaustive_matches
 from .inverted_index import InvertedIndex
 
+COMPARISONS = {
+    "gqe": (),
+    "size": ("reference_count",),
+    "length": ("query_path", "query_ids"),
+    "distance": ("d",),
+    "seed_length": ("k",),
+}
 
-def validation_rows(references, queries, index, d, strategy, indexed_search):
+
+def validation_rows(references, queries, index, d, indexed_search):
     """Compare exact IDs and distances, including queries with no matches."""
     rows = []
     for query_id, query in queries.items():
         expected = exhaustive_matches(query, references, d)
-        observed = indexed_search(index, query, d, strategy)
-        candidates = index.generate_candidates(query, d, strategy)
+        observed = indexed_search(index, query, d)
+        candidates = index.generate_candidates(query, d)
         missing = sorted(expected.keys() - observed.keys())
         unexpected = sorted(observed.keys() - expected.keys())
         wrong = sorted(
@@ -48,8 +56,8 @@ def validation_rows(references, queries, index, d, strategy, indexed_search):
     return rows
 
 
-def _require_matching_results(references, queries, index, d, strategy, indexed_search):
-    rows = validation_rows(references, queries, index, d, strategy, indexed_search)
+def _require_matching_results(references, queries, index, d, indexed_search):
+    rows = validation_rows(references, queries, index, d, indexed_search)
     failures = sum(not row["match"] for row in rows)
     if failures:
         raise ValueError(
@@ -64,13 +72,13 @@ def _batch_time(queries, operation):
     return (time.perf_counter() - start) * 1000 / len(queries)
 
 
-def benchmark(references, queries, d, k, strategy, repeats, indexed_search):
+def benchmark(references, queries, d, k, repeats, indexed_search):
     """Validate results, time both methods, then measure memory separately."""
     if not references or not queries or type(repeats) is not int or repeats < 2:
         raise ValueError("benchmark needs non-empty inputs and at least two repeats")
 
     index = InvertedIndex(references, k)
-    _require_matching_results(references, queries, index, d, strategy, indexed_search)
+    _require_matching_results(references, queries, index, d, indexed_search)
 
     build_ms = []
     for _ in range(repeats):
@@ -80,12 +88,12 @@ def benchmark(references, queries, d, k, strategy, repeats, indexed_search):
 
     # Candidate statistics and validation are outside timed search loops.
     candidates = {
-        qid: index.generate_candidates(query, d, strategy)
+        qid: index.generate_candidates(query, d)
         for qid, query in queries.items()
     }
     operations = {
         "exhaustive": lambda query: exhaustive_matches(query, references, d),
-        "indexed": lambda query: indexed_search(index, query, d, strategy),
+        "indexed": lambda query: indexed_search(index, query, d),
     }
     first_query = next(iter(queries.values()))
     for operation in operations.values():
@@ -102,7 +110,9 @@ def benchmark(references, queries, d, k, strategy, repeats, indexed_search):
     candidate_total = sum(len(c.candidate_ids) for c in candidates.values())
     metadata = {
         "reference_count": len(references), "query_count": len(queries),
-        "query_ids": list(queries), "d": d, "k": k, "strategy": strategy,
+        "average_reference_length": statistics.mean(map(len, references.values())),
+        "average_query_length": statistics.mean(map(len, queries.values())),
+        "query_ids": list(queries), "d": d, "k": k,
         "repeats": repeats,
         "fallback_count": sum(c.mode == "fallback" for c in candidates.values()),
         "candidate_count_total": candidate_total,
@@ -131,7 +141,7 @@ def benchmark(references, queries, d, k, strategy, repeats, indexed_search):
     } for name, values in samples.items()]
     memory_by_method = {
         row["method"]: row
-        for row in memory_comparison(references, queries, d, k, strategy, indexed_search)
+        for row in memory_comparison(references, queries, d, k, indexed_search)
     }
     for row in rows:
         memory = memory_by_method[row["method"]]
@@ -140,7 +150,7 @@ def benchmark(references, queries, d, k, strategy, repeats, indexed_search):
     return metadata, rows
 
 
-def memory_comparison(references, queries, d, k, strategy, indexed_search):
+def memory_comparison(references, queries, d, k, indexed_search):
     """Measure incremental Python allocations after loading the input data.
 
     Each method uses a separate tracing run. Indexed search includes one index
@@ -152,7 +162,7 @@ def memory_comparison(references, queries, d, k, strategy, indexed_search):
     if tracemalloc.is_tracing():
         raise RuntimeError("memory comparison requires tracemalloc to be stopped initially")
     index = InvertedIndex(references, k)
-    _require_matching_results(references, queries, index, d, strategy, indexed_search)
+    _require_matching_results(references, queries, index, d, indexed_search)
     del index
 
     rows = []
@@ -165,14 +175,14 @@ def memory_comparison(references, queries, d, k, strategy, indexed_search):
                 if method == "exhaustive":
                     result = exhaustive_matches(query, references, d)
                 else:
-                    result = indexed_search(index, query, d, strategy)
+                    result = indexed_search(index, query, d)
                 del result
             current, peak = tracemalloc.get_traced_memory()
         finally:
             tracemalloc.stop()
         rows.append({
             "method": method, "reference_count": len(references),
-            "query_count": len(queries), "d": d, "k": k, "strategy": strategy,
+            "query_count": len(queries), "d": d, "k": k,
             "incremental_peak_python_bytes": peak,
             "python_bytes_retained_at_end": current,
             "scope": (
@@ -194,7 +204,7 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
-def summarize_benchmarks(input_dir):
+def summarize_benchmarks(input_dir, vary="gqe"):
     """Return one summary row for each saved benchmark run."""
     metadata_files = sorted(Path(input_dir).glob("*.metadata.json"))
     if not metadata_files:
@@ -203,7 +213,10 @@ def summarize_benchmarks(input_dir):
     summary_rows = []
     first_metadata = None
     settings = ("query_path", "query_ids", "query_count", "reference_count",
-                "d", "k", "strategy", "repeats")
+                "d", "k", "repeats")
+    settings = [setting for setting in settings if setting not in COMPARISONS[vary]]
+    if vary in ("distance", "seed_length"):
+        settings.append("reference_path")
 
     for metadata_file in metadata_files:
         # Read the metadata and its matching benchmark CSV.
@@ -229,33 +242,40 @@ def summarize_benchmarks(input_dir):
         indexed_time = float(methods["indexed"]["median"])
         query_count = metadata["query_count"]
         candidate_count = metadata["candidate_count_total"]
-        eligible_count = metadata["length_eligible_count_total"]
         speedup = exhaustive_time / indexed_time if indexed_time else None
-        reduction = 100 * (1 - candidate_count / eligible_count) if eligible_count else None
+        exhaustive_memory = int(methods["exhaustive"]["incremental_peak_python_bytes"])
+        indexed_memory = int(methods["indexed"]["incremental_peak_python_bytes"])
+        memory_ratio = indexed_memory / exhaustive_memory if exhaustive_memory else None
 
-        # Get the GQE percentage from names such as reference_gqe_50pct.
         reference_name = Path(metadata["reference_path"]).stem
-        percentage = reference_name.removeprefix("reference_gqe_").removesuffix("pct")
-        percentage = int(percentage) if percentage.isdigit() else None
+        summary_row = {"reference": reference_name}
+        if vary == "gqe":
+            # This label is only relevant to the GQE frequency experiment.
+            percentage = reference_name.removeprefix("reference_gqe_").removesuffix("pct")
+            summary_row["gqe_percentage"] = int(percentage) if percentage.isdigit() else None
 
-        summary_rows.append({
-            "reference": reference_name, "gqe_percentage": percentage,
+        summary_row.update({
+            "comparison": vary,
             "reference_count": metadata["reference_count"], "query_count": query_count,
-            "d": metadata["d"], "k": metadata["k"], "strategy": metadata["strategy"],
+            "average_reference_length": metadata.get("average_reference_length"),
+            "average_query_length": metadata.get("average_query_length"),
+            "d": metadata["d"], "k": metadata["k"],
+            "fallback_count": metadata.get("fallback_count"),
             "exhaustive_median_ms_per_query": exhaustive_time,
             "indexed_median_ms_per_query": indexed_time,
             "search_speedup": speedup,
             "average_candidates_per_query": candidate_count / query_count,
-            "dp_reduction_percent": reduction,
             "index_build_median_ms": metadata["index_build_median_ms"],
-            "exhaustive_incremental_peak_python_mib":
-                int(methods["exhaustive"]["incremental_peak_python_bytes"]) / 1024**2,
-            "indexed_incremental_peak_python_mib":
-                int(methods["indexed"]["incremental_peak_python_bytes"]) / 1024**2,
-            "benchmark_csv": str(csv_file.resolve()),
+            "exhaustive_incremental_peak_python_mib": exhaustive_memory / 1024**2,
+            "indexed_incremental_peak_python_mib": indexed_memory / 1024**2,
+            "memory_ratio": memory_ratio,
         })
+        summary_rows.append(summary_row)
 
-    # Put the GQE runs in percentage order, followed by other reference names.
+    # Sort by the condition changed in this experiment.
+    sort_column = {"gqe": "gqe_percentage", "size": "reference_count",
+                   "length": "average_reference_length", "distance": "d",
+                   "seed_length": "k"}[vary]
     summary_rows.sort(key=lambda row: (
-        row["gqe_percentage"] is None, row["gqe_percentage"] or 0, row["reference"]))
+        row[sort_column] is None, row[sort_column] or 0, row["reference"]))
     return summary_rows

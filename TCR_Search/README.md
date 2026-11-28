@@ -24,11 +24,16 @@ TCR_Search/
 │   │   ├── queries.tsv
 │   │   └── annotations.jsonl.gz
 │   └── synthetic/
-│       └── length12_gqe_frequency/
-│           ├── queries.tsv
-│           ├── reference_gqe_0pct.tsv
-│           ├── reference_gqe_50pct.tsv
-│           └── reference_gqe_90pct.tsv
+│       ├── length12_gqe_frequency/
+│       │   ├── queries.tsv          # 61 general edit queries
+│       │   ├── queries_gqe.tsv      # 10 common-seed probes
+│       │   ├── reference_gqe_0pct.tsv
+│       │   ├── reference_gqe_50pct.tsv
+│       │   └── reference_gqe_90pct.tsv
+│       └── sequence_length_comparison/
+│           ├── length8/            # queries.tsv and reference.tsv
+│           ├── length12/           # queries.tsv and reference.tsv
+│           └── length18/           # queries.tsv and reference.tsv
 ├── results/                 # Generated output files
 ├── tests/                   # Input and search tests
 └── README.md
@@ -54,59 +59,115 @@ python main.py search --reference data/real/reference_n1000.tsv --queries data/r
 
 ### 2. Benchmark
 
-Check that both search methods return the same IDs and distances, then compare their execution time and memory usage:
+Each experiment compares indexed search with length-filtered exhaustive search using the same verifier. Matching IDs and exact distances are checked before timing. Both methods therefore use the same edit-distance calculation; these experiments measure indexing and candidate filtering, not DP optimisation.
 
-```bash
-python main.py benchmark --reference data/real/reference_n1000.tsv --queries data/real/queries.tsv --d 1 --k 3 --output results/benchmark_real_n1000.csv
-```
+The commands below are for PowerShell, run from `TCR_Search`. Each command creates its output directory, writes one CSV and one `.metadata.json` per run, and automatically generates `summary.csv`. Start with a missing or empty output directory. Choose a new `--output-dir` to repeat an experiment; existing results are not overwritten.
 
-Both methods use the same verifier. Timing is repeated five times by default, and index construction time is reported separately. Memory is measured in a separate run after timing.
+Use `--vary` to name the condition being changed. All other experimental conditions are kept fixed. `--d` and `--k` accept multiple values for their corresponding comparison. Seed positions are selected automatically. For length comparisons, query and reference files are paired in the order given, rather than searching every reference with every query file.
 
-This command saves `results/benchmark_real_n1000.csv` and `results/benchmark_real_n1000.metadata.json`. Without `--output`, the default names are `results/benchmark.csv` and `results/benchmark.metadata.json`. Search timing excludes data loading, validation, annotation attachment, and file output. Memory figures cover incremental Python allocations after input loading, including index construction for indexed search; they are not total process memory. Benchmarking does not load annotations.
+#### A. Real data: database size
 
-To compare the three synthetic GQE databases and generate all reports plus a summary in one command, run this in PowerShell:
+Question: how do search time, speedup, index construction time and memory change as the database grows? Use the same 100 real queries with the nested reference subsets of 1,000, 5,000 and 10,000 sequences.
 
 ```powershell
 python main.py benchmark `
-  --queries data/synthetic/length12_gqe_frequency/queries.tsv `
-  --reference data/synthetic/length12_gqe_frequency/reference_gqe_0pct.tsv `
-              data/synthetic/length12_gqe_frequency/reference_gqe_50pct.tsv `
-              data/synthetic/length12_gqe_frequency/reference_gqe_90pct.tsv `
-  --d 2 --k 3 --strategy spread --repeats 5 `
-  --output-dir results/length12_comparison
+  --vary size `
+  --reference data/real/reference_n1000.tsv data/real/reference_n5000.tsv data/real/reference_n10000.tsv `
+  --queries data/real/queries.tsv `
+  --d 1 --k 3 --repeats 5 `
+  --output-dir results/real_size
 ```
 
-The command searches each reference database using the same queries and settings, benchmarks both methods, then automatically writes `summary.csv`. No separate summary command is needed. The output directory is created if it does not exist and must be empty if it already exists. Reference databases must have the same number of sequences for this comparison. To run another comparison, choose a new `--output-dir`.
+Outputs: `n1000.csv`, `n5000.csv`, `n10000.csv`, their metadata files, and `summary.csv`. Each row of the summary describes a different reference size. The supplied real queries are exact copies present in all three subsets; use the synthetic experiments below to cover edited queries.
 
-Starting with an empty `results` directory, this produces exactly:
+#### B. Synthetic data: GQE frequency
 
-```text
-results/length12_comparison/
-├── gqe_0pct.csv
-├── gqe_0pct.metadata.json
-├── gqe_50pct.csv
-├── gqe_50pct.metadata.json
-├── gqe_90pct.csv
-├── gqe_90pct.metadata.json
-└── summary.csv
+Question: how does a common seed affect candidate counts and speedup? Keep reference length 12 and size 1,000; vary the proportion containing GQE from 0% to 50% to 90%.
+
+Use `queries_gqe.tsv`, the 10 queries copied from the original data package's `synthetic/motif_probes/L12/queries.tsv`. With `k=3` and `d=2`, every probe selects GQE as one of its automatically chosen seeds. Distance and seed-length experiments use the 61 general edit queries in `sequence_length_comparison/length12/`.
+
+```powershell
+$data = "data/synthetic/length12_gqe_frequency"
+python main.py benchmark `
+  --vary gqe `
+  --reference "$data/reference_gqe_0pct.tsv" "$data/reference_gqe_50pct.tsv" "$data/reference_gqe_90pct.tsv" `
+  --queries "$data/queries_gqe.tsv" `
+  --d 2 --k 3 --repeats 5 `
+  --output-dir results/gqe_frequency
 ```
 
-Use `--output` for one benchmark CSV, or `--output-dir` for benchmark reports and an automatic summary. These options cannot be combined; custom `--metadata` paths apply only to single-file output.
+Outputs: `gqe_0pct.csv`, `gqe_50pct.csv`, `gqe_90pct.csv`, their metadata files, and `summary.csv`. Compare average candidate counts and search times; the proportion of references sharing a seed does not by itself determine the number of final matches.
 
-The summary contains one row per run, sorted by the GQE percentage labelled in the reference filename (`reference_gqe_0pct.tsv`, `reference_gqe_50pct.tsv`, `reference_gqe_90pct.tsv`). These percentages are filename labels, not values measured by the summary command. Other reference filenames can also be summarized, with the percentage left blank.
+#### C. Synthetic data: sequence length
+
+Question: how does sequence length affect the benefit of indexing? Compare the length-8, length-12 and length-18 data groups, each with 1,000 reference sequences and 61 queries of the same edit-category composition. All reference databases have 0% GQE. Each database uses its own paired queries.
+
+```powershell
+$data = "data/synthetic/sequence_length_comparison"
+python main.py benchmark `
+  --vary length `
+  --reference "$data/length8/reference.tsv" "$data/length12/reference.tsv" "$data/length18/reference.tsv" `
+  --queries "$data/length8/queries.tsv" "$data/length12/queries.tsv" "$data/length18/queries.tsv" `
+  --d 2 --k 3 --repeats 5 `
+  --output-dir results/sequence_length
+```
+
+Outputs: `length8.csv`, `length12.csv`, `length18.csv`, their metadata files, and `summary.csv`. Compare speedup, average candidates and `fallback_count`. A query needs at least `k * (d + 1)` characters for indexed seed selection; with these parameters a length-8 query falls back to verifying all length-eligible references. The groups include insertion, deletion and short-query cases, so individual query lengths differ from the reference length. Different groups also contain different sequences; interpret this as a comparison under the same generation rules, rather than an isolated causal effect of length alone.
+
+#### D. Distance threshold
+
+Question: what happens when the permitted edit distance increases? Use the 0%-GQE length-12 reference and its 61 general edit queries from `sequence_length_comparison/length12/`, varying only `d`.
+
+```powershell
+$data = "data/synthetic/sequence_length_comparison/length12"
+python main.py benchmark `
+  --vary distance `
+  --reference "$data/reference.tsv" --queries "$data/queries.tsv" `
+  --d 0 1 2 3 --k 3 --repeats 5 `
+  --output-dir results/distance_threshold
+```
+
+Outputs: `d0.csv` through `d3.csv`, their metadata files, and `summary.csv`. A larger `d` changes both the valid match set and how many seeds are required. Compare candidate counts, fallback counts and speedup while checking that both methods agree at each threshold. Do not confuse `d`, the search acceptance threshold, with `applied_edits`, which records how a query was generated.
+
+#### E. Seed length
+
+Vary seed length `k`, keeping the same length-12 data and `d`. Seed positions are selected automatically:
+
+```powershell
+$data = "data/synthetic/sequence_length_comparison/length12"
+python main.py benchmark `
+  --vary seed_length `
+  --reference "$data/reference.tsv" --queries "$data/queries.tsv" `
+  --d 2 --k 2 3 4 --repeats 5 `
+  --output-dir results/seed_length
+```
+
+Outputs: `k2.csv`, `k3.csv`, `k4.csv`, their metadata files, and `summary.csv`. `k` is the length of each seed, not the number of seeds. Longer seeds may give smaller posting lists, but more queries may be too short to fit `d + 1` disjoint seeds.
+
+#### Reading the reports
+
+Each benchmark CSV contains an `exhaustive` row and an `indexed` row. Times are measured over five repeated query batches by default, with mean, median, standard error and samples recorded. A timing sample is the whole batch's elapsed time divided by its query count; it is not the median of individual-query latencies. Standard error is calculated across the repeated batch averages, not as an error bar for the median. Index construction time is measured separately; memory is measured in separate tracing runs after timing. Input loading, correctness checks, annotation attachment and file output are outside the timed search loops.
+
+Each summary has one row per run, sorted by the changed condition:
 
 | Summary column | Meaning |
 |---|---|
+| `comparison`, `reference` | Experiment type and reference name |
+| `gqe_percentage` | Included only with `--vary gqe`; percentage label from the reference filename |
+| `reference_count`, `query_count` | Input sizes |
+| `average_reference_length`, `average_query_length` | Mean sequence lengths; a length-12 reference group can contain queries of other lengths |
+| `d`, `k` | Maximum edit distance and seed length |
+| `fallback_count` | Number of queries using the short-query fallback |
 | `exhaustive_median_ms_per_query`, `indexed_median_ms_per_query` | Median search time per query for each method |
 | `search_speedup` | Exhaustive median divided by indexed median; excludes index construction |
 | `average_candidates_per_query` | Total indexed candidates divided by query count |
-| `dp_reduction_percent` | Candidate reduction relative to all length-eligible references, as a percentage |
 | `index_build_median_ms` | Median time to build one index |
-| `exhaustive_incremental_peak_python_mib`, `indexed_incremental_peak_python_mib` | Incremental peak Python allocations in MiB; indexed includes index construction, not process RSS |
+| `exhaustive_incremental_peak_python_mib`, `indexed_incremental_peak_python_mib` | Incremental peak Python allocations in MiB; indexed includes index construction, not total process memory or RSS |
+| `memory_ratio` | Indexed incremental peak memory divided by exhaustive incremental peak memory: greater than 1 means more memory, less than 1 means less. Blank if exhaustive peak is zero. This is an incremental-memory ratio, not a total-process-memory ratio. |
 
-Each row also records the reference, reference/query counts, `d`, `k`, strategy, and source CSV path. The command checks that runs use the same recorded query path and IDs, query/reference counts, `d`, `k`, strategy, and repeat count. Use reports produced with the same query file contents and environment; the summary does not check historical file contents or machine details.
+The summary checks the conditions that should remain fixed for the selected `--vary`. Query paths and IDs are compared except in length experiments, where different query sets are intentional. Use unchanged input files and the same execution environment throughout a comparison. Older reports may leave new length/fallback fields blank. For means and standard errors, consult the individual benchmark CSVs.
 
-The supplied 61 synthetic queries cover exact copies, substitutions, insertions, deletions, short queries, and no-match cases. Under `k=3`, `d=2`, and `spread`, none selects GQE as a seed. The summary therefore shows performance across the three reference databases; a causal test of the common GQE seed requires queries that actually select that seed.
+For one benchmark without a batch summary, the previous single-reference command with `--output` still works. `--output` and `--output-dir` cannot be combined; a custom `--metadata` path applies only to single-file output. To rebuild a summary from existing reports without rerunning benchmarks, use `python main.py summarize --vary size --input-dir results/real_size --output results/real_size/summary_copy.csv`, changing `--vary` and paths for the desired experiment.
 
 ## Input and Output
 
