@@ -1,28 +1,35 @@
-"""Build a k-mer index and retrieve candidates for full-sequence verification."""
-
+"""Build a k-mer index and find candidates for edit-distance verification."""
 from collections import defaultdict
 from types import MappingProxyType
+from .data_input import STRATEGIES, check_id, check_sequence, require_integer
 
-from .data_input import AMINO_ACIDS, STRATEGIES, check_id, check_sequence, require_integer
-
+def select_seed_positions(m, k, d, strategy="spread"):
+    """Return d+1 disjoint seed starts, or an empty tuple for fallback."""
+    require_integer(m, "m", 0)
+    require_integer(k, "k", 1)
+    require_integer(d, "d", 0)
+    if strategy not in STRATEGIES:
+        raise ValueError("strategy must be spread or prefix")
+    if m < k * (d + 1):
+        return ()
+    if d == 0 or strategy == "prefix":
+        return tuple(i * k for i in range(d + 1))
+    return tuple(i * (m - k) // d for i in range(d + 1))  # End at m - k.
 
 class InvertedIndex:
     def __init__(self, references, k=3):
         require_integer(k, "k", 1)
         self._k = k
-        self.references = MappingProxyType(dict(references))
+        self.references = MappingProxyType(dict(references))  # Keep a read-only copy.
         postings = defaultdict(set)
         by_length = defaultdict(set)
-
         for rid, sequence in self.references.items():
             check_id(rid)
             check_sequence(sequence, allow_empty=True)
             by_length[len(sequence)].add(rid)
-            # With k=2, CASS adds this ID to the lists for CA, AS, and SS.
             for start in range(len(sequence) - k + 1):
                 kmer = sequence[start:start + k]
                 postings[kmer].add(rid)
-
         self.postings = _freeze_groups(postings)
         self.by_length = _freeze_groups(by_length)
 
@@ -34,47 +41,30 @@ class InvertedIndex:
         check_sequence(query, allow_empty=True)
         m = len(query)
         starts = select_seed_positions(m, self.k, d, strategy)
-        length_groups = [ids for length, ids in self.by_length.items() if abs(length - m) <= d]
+        groups = [ids for n, ids in self.by_length.items() if abs(n - m) <= d]
+        hits = set()
+        if not starts:  # Too short for d+1 seeds. Use all length-eligible IDs.
+            for ids in groups:
+                hits.update(ids)
+            return CandidateResult(hits, "fallback", len(hits))
 
-        # Short query: keep every reference within d residues of the query length.
-        if not starts:
-            candidates = frozenset().union(*length_groups)
-            return CandidateResult(candidates, "fallback", len(candidates))
-
-        # At most d edits can disrupt d of the d+1 seeds. A hit on any seed is enough here.
-        seeds = tuple(query[start:start + self.k] for start in starts)
-        postings = [self.postings.get(seed, ()) for seed in seeds]
-        hits = frozenset().union(*postings)
-        eligible_count = sum(len(ids) for ids in length_groups)
-        candidates = hits  # Reuse all hits when every reference passes the length filter.
-        if eligible_count < len(self.references):
-            candidates = frozenset(rid for rid in hits if abs(len(self.references[rid]) - m) <= d)
-        return CandidateResult(
-            candidates, "indexed", eligible_count, seed_positions=starts, seeds=seeds,
-            posting_sizes=[len(ids) for ids in postings], union_count=len(hits),
-        )
-
-
-def select_seed_positions(m, k, d, strategy="spread"):
-    """Return zero-based starts of d+1 disjoint seeds, or an empty tuple for fallback."""
-    require_integer(m, "m", 0)
-    require_integer(k, "k", 1)
-    require_integer(d, "d", 0)
-    if strategy not in STRATEGIES:
-        raise ValueError("strategy must be spread or prefix")
-    if m < k * (d + 1):
-        return ()
-    if d == 0:
-        return (0,)
-    if strategy == "prefix":
-        return tuple(i * k for i in range(d + 1))
-    # Spread the starts from 0 to m-k, rounding each position down.
-    return tuple(i * (m - k) // d for i in range(d + 1))
+        # Any reference within d edits must contain at least one of these seeds.
+        seeds = [query[start:start + self.k] for start in starts]
+        sizes = []
+        for seed in seeds:
+            ids = self.postings.get(seed, ())
+            hits.update(ids)
+            sizes.append(len(ids))
+        union_count = len(hits)  # Unique seed hits before length filtering.
+        eligible = sum(len(ids) for ids in groups)
+        if eligible < len(self.references):
+            hits = {rid for rid in hits if abs(len(self.references[rid]) - m) <= d}
+        return CandidateResult(hits, "indexed", eligible, seed_positions=starts,
+                               seeds=seeds, posting_sizes=sizes, union_count=union_count)
 
 
 class CandidateResult:
-    """Candidate IDs for the distance verifier, along with the seed lookup details."""
-
+    """Candidate IDs and the evidence used to select them."""
     def __init__(self, candidate_ids, mode, length_eligible_count,
                  seed_positions=(), seeds=(), posting_sizes=(), union_count=None):
         self.candidate_ids = frozenset(candidate_ids)
@@ -95,7 +85,7 @@ class CandidateResult:
 
 
 def _freeze_groups(groups):
-    # Freeze each group in place so the old sets can be released one at a time.
-    for key, ids in groups.items():
-        groups[key] = frozenset(ids)
+    # Replace each set in turn to limit peak memory during construction.
+    for key in groups:
+        groups[key] = frozenset(groups[key])
     return MappingProxyType(dict(groups))
